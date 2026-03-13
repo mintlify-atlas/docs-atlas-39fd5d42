@@ -1,0 +1,593 @@
+---
+title: 'Fee Estimation'
+description: 'Calculate optimal Bitcoin transaction fees with fee bumping support'
+---
+
+## Overview
+
+Muun's fee estimation system calculates fees based on transaction size, fee rate, and child-pays-for-parent (CPFP) fee bumping for unconfirmed UTXOs.
+
+## Fee Calculator
+
+### Structure
+
+```go
+type feeCalculator struct {
+    NextTransactionSize *NextTransactionSize
+    // Fee bump functions for each unconfirmed UTXO
+    feeBumpFunctions []*FeeBumpFunction
+}
+```
+
+### Fee Calculation
+
+<CodeGroup>
+
+```go Go (libwallet/operation/fees.go:21)
+func (f *feeCalculator) Fee(
+    amountInSat int64,
+    feeRateInSatsPerVByte float64,
+    takeFeeFromAmount bool,
+) (totalFee int64, feeBump int64) {
+    if amountInSat == 0 {
+        return 0, 0
+    }
+    return f.calculateFee(amountInSat, feeRateInSatsPerVByte, takeFeeFromAmount)
+}
+```
+
+```swift iOS
+let calculator = try! LibwalletNewFeeCalculator(
+    nextTxSize,
+    feeBumpFunctions
+)
+
+let (totalFee, feeBump) = calculator.fee(
+    amountInSat: 100000,
+    feeRateInSatsPerVByte: 10.0,
+    takeFeeFromAmount: false
+)
+
+print("Total fee: \(totalFee) sats")
+print("Fee bump: \(feeBump) sats")
+```
+
+</CodeGroup>
+
+## Next Transaction Size
+
+### SizeProgression
+
+Tracks how transaction size grows as UTXOs are added:
+
+```go
+type NextTransactionSize struct {
+    SizeProgression []*SizeForAmount
+    // Maps amount -> transaction size
+}
+
+type SizeForAmount struct {
+    AmountInSat int64
+    SizeInVByte int64
+    UtxoStatus  UtxosStatus
+}
+
+type UtxosStatus int
+
+const (
+    UtxosStatusConfirmed UtxosStatus = iota
+    UtxosStatusUnconfirmed
+)
+```
+
+### Example Size Progression
+
+```swift
+let sizeProgression = [
+    SizeForAmount(
+        amountInSat: 50000,
+        sizeInVByte: 140,
+        utxoStatus: .confirmed
+    ),
+    SizeForAmount(
+        amountInSat: 150000,
+        sizeInVByte: 210,
+        utxoStatus: .confirmed
+    ),
+    SizeForAmount(
+        amountInSat: 200000,
+        sizeInVByte: 280,
+        utxoStatus: .unconfirmed  // This one needs fee bump
+    ),
+]
+```
+
+## Fee Computation
+
+### Basic Fee Formula
+
+```go
+func computeFee(
+    sizeInVByte int64,
+    feeRate float64,
+    feeBumpAmount int64,
+) int64 {
+    return int64(math.Ceil(float64(sizeInVByte) * feeRate)) + feeBumpAmount
+}
+```
+
+### Fee Calculation Logic
+
+```go
+func (f *feeCalculator) calculateFee(
+    amountInSat int64,
+    feeRateInSatsPerVByte float64,
+    takeFeeFromAmount bool,
+) (totalFee int64, feeBump int64) {
+    if f.NextTransactionSize == nil {
+        return 0, 0
+    }
+    
+    var fee int64
+    lastUnconfirmedUtxoUsedIndex := -1
+    var feeBumpAmount int64 = 0
+    
+    for _, sizeForAmount := range f.NextTransactionSize.SizeProgression {
+        // Track unconfirmed UTXOs
+        if sizeForAmount.UtxoStatus == UtxosStatusUnconfirmed {
+            lastUnconfirmedUtxoUsedIndex++
+        }
+        
+        // Calculate fee bump for unconfirmed ancestors
+        feeBumpAmount = 0
+        if lastUnconfirmedUtxoUsedIndex >= 0 {
+            var err error
+            feeBumpAmount, err = f.calculateFeeBumpAmount(
+                lastUnconfirmedUtxoUsedIndex,
+                feeRateInSatsPerVByte,
+            )
+            if err != nil {
+                slog.Error("error calculating fee bump", "error", err)
+            }
+        }
+        
+        // Compute total fee
+        fee = computeFee(sizeForAmount.SizeInVByte, feeRateInSatsPerVByte, feeBumpAmount)
+        
+        // Check if we have enough UTXOs
+        if takeFeeFromAmount {
+            if sizeForAmount.AmountInSat >= amountInSat {
+                break // No more UTXOs needed
+            }
+        } else {
+            if sizeForAmount.AmountInSat >= amountInSat+fee {
+                break // No more UTXOs needed
+            }
+        }
+    }
+    
+    return fee, feeBumpAmount
+}
+```
+
+## Child-Pays-For-Parent (CPFP)
+
+### Fee Bump Functions
+
+When spending unconfirmed UTXOs, we must pay extra fees to bump ancestor transactions:
+
+```go
+type FeeBumpFunction struct {
+    // Function coefficients for fee calculation
+    Coefficients []float64
+}
+
+func (f *FeeBumpFunction) GetBumpAmountForFeeRate(
+    feeRateInSatsPerVByte float64,
+) (int64, error) {
+    // Evaluate polynomial function
+    var result float64
+    for i, coeff := range f.Coefficients {
+        result += coeff * math.Pow(feeRateInSatsPerVByte, float64(i))
+    }
+    return int64(math.Ceil(result)), nil
+}
+```
+
+### Calculating Fee Bump
+
+```go
+func (f *feeCalculator) calculateFeeBumpAmount(
+    lastUnconfirmedUtxoUsedIndex int,
+    feeRateInSatsPerVByte float64,
+) (int64, error) {
+    // If feature flag is OFF, this can be nil
+    if len(f.feeBumpFunctions) == 0 {
+        return 0, errors.New("fee bump functions were not loaded")
+    }
+    
+    functionIndex := f.getFeeBumpFunctionIndex(lastUnconfirmedUtxoUsedIndex)
+    
+    feeBumpAmount, err := f.feeBumpFunctions[functionIndex].GetBumpAmountForFeeRate(
+        feeRateInSatsPerVByte,
+    )
+    
+    if err != nil {
+        return 0, err
+    }
+    
+    return feeBumpAmount, nil
+}
+```
+
+### Fee Bump Function Index
+
+```go
+func (f *feeCalculator) getFeeBumpFunctionIndex(
+    lastUnconfirmedUtxoUsedIndex int,
+) int {
+    // We might have fewer fee bump functions than unconfirmed UTXOs;
+    // in that case, use the last fee bump function.
+    if lastUnconfirmedUtxoUsedIndex >= len(f.feeBumpFunctions) {
+        lastUnconfirmedUtxoUsedIndex = len(f.feeBumpFunctions) - 1
+    }
+    return lastUnconfirmedUtxoUsedIndex
+}
+```
+
+## Fee Windows
+
+### FeeWindow Structure
+
+Defines fee rates for different confirmation targets:
+
+```go
+type FeeWindow struct {
+    TargetBlocks int64
+    FeeInSatPerVByte float64
+}
+```
+
+### Multiple Fee Options
+
+<Tabs>
+  <Tab title="Go">
+    ```go
+    feeWindows := []*FeeWindow{
+        {TargetBlocks: 1, FeeInSatPerVByte: 50.0},  // Fast
+        {TargetBlocks: 6, FeeInSatPerVByte: 20.0},  // Medium
+        {TargetBlocks: 24, FeeInSatPerVByte: 5.0},  // Slow
+    }
+    
+    for _, window := range feeWindows {
+        fee, bump := calculator.Fee(
+            amount,
+            window.FeeInSatPerVByte,
+            false,
+        )
+        fmt.Printf("%d blocks: %d sats\n", window.TargetBlocks, fee)
+    }
+    ```
+  </Tab>
+  
+  <Tab title="Swift">
+    ```swift
+    struct FeeOption {
+        let targetBlocks: Int
+        let feeRate: Double
+        
+        static let fast = FeeOption(targetBlocks: 1, feeRate: 50.0)
+        static let medium = FeeOption(targetBlocks: 6, feeRate: 20.0)
+        static let slow = FeeOption(targetBlocks: 24, feeRate: 5.0)
+    }
+    
+    let options = [FeeOption.fast, .medium, .slow]
+    
+    for option in options {
+        let (fee, bump) = calculator.fee(
+            amountInSat: amount,
+            feeRateInSatsPerVByte: option.feeRate,
+            takeFeeFromAmount: false
+        )
+        print("\(option.targetBlocks) blocks: \(fee) sats")
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Transaction Size Estimation
+
+### Address Version Sizes
+
+<ParamField name="V1 (P2PKH)" type="int">
+  Input: ~148 vbytes
+  
+  Output: ~34 vbytes
+</ParamField>
+
+<ParamField name="V2 (P2SH)" type="int">
+  Input: ~107 vbytes
+  
+  Output: ~32 vbytes
+</ParamField>
+
+<ParamField name="V3/V4 (P2WSH)" type="int">
+  Input: ~68 vbytes
+  
+  Output: ~43 vbytes
+</ParamField>
+
+<ParamField name="V5/V6 (P2TR)" type="int">
+  Input: ~57.5 vbytes
+  
+  Output: ~43 vbytes
+</ParamField>
+
+### Size Calculation Example
+
+```go
+func estimateTransactionSize(
+    inputs []Input,
+    outputs int,
+) int64 {
+    // Base transaction overhead
+    var size int64 = 10
+    
+    // Add input sizes
+    for _, input := range inputs {
+        switch input.Address().Version() {
+        case addresses.V1:
+            size += 148
+        case addresses.V2:
+            size += 107
+        case addresses.V3, addresses.V4:
+            size += 68
+        case addresses.V5, addresses.V6:
+            size += 58 // Taproot keyspend
+        }
+    }
+    
+    // Add output sizes
+    size += int64(outputs * 43) // Assume modern outputs
+    
+    return size
+}
+```
+
+## Fee Rate Sources
+
+### From Server
+
+Muun server provides fee windows:
+
+```swift
+struct FeeWindowResponse {
+    let targetBlocks: Int
+    let feeInSatPerVByte: Double
+}
+
+func fetchFeeWindows() async throws -> [FeeWindowResponse] {
+    let response = try await apiClient.get("/fee-windows")
+    return try JSONDecoder().decode([FeeWindowResponse].self, from: response)
+}
+```
+
+### Fallback Defaults
+
+```swift
+let defaultFeeWindows = [
+    FeeWindow(targetBlocks: 1, feeInSatPerVByte: 50.0),
+    FeeWindow(targetBlocks: 6, feeInSatPerVByte: 10.0),
+    FeeWindow(targetBlocks: 24, feeInSatPerVByte: 1.0),
+]
+```
+
+## Complete Example
+
+### iOS Fee Estimation
+
+```swift
+class FeeEstimator {
+    let calculator: LibwalletFeeCalculator
+    
+    init(
+        utxos: [UTXO],
+        feeBumpFunctions: [FeeBumpFunction]
+    ) throws {
+        // Build size progression
+        var sizeProgression: [SizeForAmount] = []
+        var cumulativeAmount: Int64 = 0
+        var cumulativeSize: Int64 = 10 // Base TX overhead
+        
+        for utxo in utxos {
+            cumulativeAmount += utxo.amount
+            cumulativeSize += utxo.estimatedInputSize()
+            
+            sizeProgression.append(SizeForAmount(
+                amountInSat: cumulativeAmount,
+                sizeInVByte: cumulativeSize,
+                utxoStatus: utxo.isConfirmed ? .confirmed : .unconfirmed
+            ))
+        }
+        
+        // Add change output size
+        cumulativeSize += 43
+        
+        let nextTxSize = NextTransactionSize(
+            sizeProgression: sizeProgression
+        )
+        
+        self.calculator = try LibwalletNewFeeCalculator(
+            nextTxSize,
+            feeBumpFunctions
+        )
+    }
+    
+    func estimateFee(
+        amount: Int64,
+        feeRate: Double,
+        subtractFeeFromAmount: Bool = false
+    ) -> (totalFee: Int64, feeBump: Int64) {
+        return calculator.fee(
+            amountInSat: amount,
+            feeRateInSatsPerVByte: feeRate,
+            takeFeeFromAmount: subtractFeeFromAmount
+        )
+    }
+    
+    func estimateAllFeeOptions(
+        amount: Int64
+    ) -> [FeeOption] {
+        let feeWindows = [
+            (blocks: 1, rate: 50.0),
+            (blocks: 6, rate: 20.0),
+            (blocks: 24, rate: 5.0),
+        ]
+        
+        return feeWindows.map { window in
+            let (fee, bump) = estimateFee(
+                amount: amount,
+                feeRate: window.rate
+            )
+            
+            return FeeOption(
+                targetBlocks: window.blocks,
+                feeRate: window.rate,
+                totalFee: fee,
+                feeBump: bump
+            )
+        }
+    }
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Consider Fee Bumping">
+    Always account for fee bumping when using unconfirmed UTXOs:
+    ```swift
+    let (baseFee, feeBump) = calculator.fee(
+        amountInSat: amount,
+        feeRateInSatsPerVByte: feeRate,
+        takeFeeFromAmount: false
+    )
+    
+    print("Base fee: \(baseFee - feeBump) sats")
+    print("Fee bump: \(feeBump) sats")
+    print("Total: \(baseFee) sats")
+    ```
+  </Accordion>
+  
+  <Accordion title="Sort UTXOs Efficiently">
+    Sort UTXOs to minimize fee bumping costs:
+    ```swift
+    // Use confirmed UTXOs first
+    let sortedUtxos = utxos.sorted { utxo1, utxo2 in
+        if utxo1.isConfirmed != utxo2.isConfirmed {
+            return utxo1.isConfirmed
+        }
+        // Then by amount (largest first)
+        return utxo1.amount > utxo2.amount
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Cache Fee Calculations">
+    Fee calculations can be expensive with many UTXOs:
+    ```swift
+    class FeeCache {
+        private var cache: [CacheKey: FeeResult] = [:]
+        
+        struct CacheKey: Hashable {
+            let amount: Int64
+            let feeRate: Double
+            let subtractFee: Bool
+        }
+        
+        func getFee(
+            amount: Int64,
+            feeRate: Double,
+            subtractFee: Bool
+        ) -> (Int64, Int64) {
+            let key = CacheKey(
+                amount: amount,
+                feeRate: feeRate,
+                subtractFee: subtractFee
+            )
+            
+            if let cached = cache[key] {
+                return (cached.totalFee, cached.feeBump)
+            }
+            
+            let result = calculator.fee(
+                amountInSat: amount,
+                feeRateInSatsPerVByte: feeRate,
+                takeFeeFromAmount: subtractFee
+            )
+            
+            cache[key] = FeeResult(totalFee: result.0, feeBump: result.1)
+            return result
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Handle Edge Cases">
+    ```swift
+    func validateFeeEstimate(
+        amount: Int64,
+        fee: Int64,
+        availableBalance: Int64
+    ) throws {
+        // Check sufficient balance
+        guard amount + fee <= availableBalance else {
+            throw FeeError.insufficientBalance
+        }
+        
+        // Check minimum fee (1 sat/vbyte minimum)
+        let estimatedSize = calculateTxSize()
+        guard fee >= estimatedSize else {
+            throw FeeError.feeTooLow
+        }
+        
+        // Check maximum fee (sanity check)
+        guard fee < amount / 2 else {
+            throw FeeError.feeTooHigh
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Dust Threshold
+
+Outputs below 546 satoshis are considered "dust":
+
+```go
+const dustThreshold = 546
+
+// Check if amount is dust
+if changeAmount < dustThreshold {
+    // Add to fee instead of creating output
+    totalFee += changeAmount
+    changeAmount = 0
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Transaction Building" icon="hammer" href="/libwallet/transactions">
+    Build transactions with calculated fees
+  </Card>
+  <Card title="UTXO Management" icon="coins" href="/libwallet/addresses">
+    Manage UTXOs across address versions
+  </Card>
+  <Card title="Submarine Swaps" icon="repeat" href="/libwallet/lightning/swaps">
+    Lightning swap fee estimation
+  </Card>
+  <Card title="Network Fees" icon="chart-line" href="/libwallet/getting-started">
+    Fetch current network fee rates
+  </Card>
+</CardGroup>

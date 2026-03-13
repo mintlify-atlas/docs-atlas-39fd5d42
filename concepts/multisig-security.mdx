@@ -1,0 +1,374 @@
+---
+title: 2-of-2 Multisig Security
+description: How Muun implements non-custodial 2-of-2 multisignature security
+---
+
+## Overview
+
+Muun Wallet uses a **2-of-2 multisignature** scheme where every transaction requires signatures from both:
+
+1. **User's key** - Stored only on the user's device
+2. **Muun's key** - Stored only on Muun's servers
+
+This design provides both security and convenience: neither party can spend funds unilaterally, yet normal operations feel seamless to users.
+
+<Info>
+Muun is **non-custodial**: users always maintain control of their funds through their recovery code, even if Muun's servers are unavailable.
+</Info>
+
+## How 2-of-2 Multisig Works
+
+### Address Creation
+
+Multisig addresses are created by combining public keys from both parties:
+
+```go
+// Source: libwallet/addresses/v2.go:32-59
+func createMultisigRedeemScript(userKey, muunKey *hdkeychain.ExtendedKey, 
+                                network *chaincfg.Params) ([]byte, error) {
+    userPublicKey, err := userKey.ECPubKey()
+    if err != nil {
+        return nil, err
+    }
+    userAddress, err := btcutil.NewAddressPubKey(
+        userPublicKey.SerializeCompressed(), network)
+    if err != nil {
+        return nil, errors.Wrapf(err, "failed to generate address for user")
+    }
+    
+    muunPublicKey, err := muunKey.ECPubKey()
+    if err != nil {
+        return nil, err
+    }
+    WalletAddress, err := btcutil.NewAddressPubKey(
+        muunPublicKey.SerializeCompressed(), network)
+    if err != nil {
+        return nil, errors.Wrapf(err, "failed to generate address for muun")
+    }
+    
+    // Create 2-of-2 multisig script
+    return txscript.MultiSigScript([]*btcutil.AddressPubKey{
+        userAddress,
+        WalletAddress,
+    }, 2)
+}
+```
+
+### Key Points
+
+<CardGroup cols={2}>
+  <Card title="User Control" icon="user">
+    User holds their private key locally, never shared with Muun
+  </Card>
+  <Card title="Muun Cooperation" icon="handshake">
+    Muun co-signs transactions for normal operations
+  </Card>
+  <Card title="Emergency Recovery" icon="life-ring">
+    Recovery code allows spending without Muun's cooperation
+  </Card>
+  <Card title="No Single Point of Failure" icon="shield-check">
+    Neither party can steal or freeze funds alone
+  </Card>
+</CardGroup>
+
+## Evolution to Taproot and MuSig2
+
+### Traditional Multisig (V2-V4)
+
+Older address versions use **explicit multisig scripts**:
+
+- **Pros**: Well-established, widely supported
+- **Cons**: Higher fees, less privacy (multisig is visible on-chain)
+
+### Modern Approach: MuSig2 (V5-V6)
+
+Newer addresses use **Taproot with MuSig2**, which aggregates signatures:
+
+```go
+// Source: libwallet/addresses/v5.go:31-56
+func CreateWitnessScriptV5(userKey, muunKey *hdkeychain.ExtendedKey) ([]byte, error) {
+    userPublicKey, err := userKey.ECPubKey()
+    if err != nil {
+        return nil, fmt.Errorf("error getting pub key: %w", err)
+    }
+    muunPublicKey, err := muunKey.ECPubKey()
+    if err != nil {
+        return nil, fmt.Errorf("error getting pub key: %w", err)
+    }
+    
+    pubKeys := [][]byte{
+        userPublicKey.SerializeCompressed(),
+        muunPublicKey.SerializeCompressed(),
+    }
+    
+    tweak := musig.KeySpendOnlyTweak()
+    
+    // Aggregate keys using MuSig2
+    aggregateKey, err := musig.Musig2CombinePubKeysWithTweak(
+        musig.Musig2v040Muun, pubKeys, tweak)
+    if err != nil {
+        return nil, fmt.Errorf("error combining keys: %w", err)
+    }
+    
+    xOnlyCombined := aggregateKey.FinalKey.SerializeCompressed()[1:]
+    
+    return xOnlyCombined, nil
+}
+```
+
+#### MuSig2 Advantages
+
+<CardGroup cols={3}>
+  <Card title="Lower Fees" icon="coins">
+    Smaller transaction size = lower mining fees
+  </Card>
+  <Card title="Better Privacy" icon="eye-slash">
+    Looks like single-sig on-chain
+  </Card>
+  <Card title="Native Taproot" icon="bolt">
+    Future-proof with Bitcoin's latest features
+  </Card>
+</CardGroup>
+
+## Signing Process
+
+### 1. Transaction Verification
+
+Before signing, the client verifies transaction integrity:
+
+```go
+// Source: libwallet/partiallysignedtransaction.go:221-245
+func (p *PartiallySignedTransaction) Verify(expectations *SigningExpectations, 
+    userPublicKey *HDPublicKey, muunPublickKey *HDPublicKey) error {
+    
+    network := userPublicKey.Network
+    
+    // Verify output count
+    if expectations.change != nil {
+        if expectations.alternative {
+            if len(p.tx.TxOut) > 2 {
+                return fmt.Errorf("expected at most destination and change outputs but found %v", 
+                    len(p.tx.TxOut))
+            }
+        } else if len(p.tx.TxOut) != 2 {
+            return fmt.Errorf("expected destination and change outputs but found %v", 
+                len(p.tx.TxOut))
+        }
+    } else if len(p.tx.TxOut) != 1 {
+        return fmt.Errorf("expected destination output only but found %v", 
+            len(p.tx.TxOut))
+    }
+    
+    // Build and verify destination script
+    toScript, err := addressToScript(expectations.destination, network)
+    if err != nil {
+        return err
+    }
+    
+    // ... additional verification
+}
+```
+
+<Warning>
+The client **must never** sign a transaction without verifying:
+- Destination address matches user intent
+- Amount is correct
+- Fees are reasonable
+- Change address is owned by the wallet
+</Warning>
+
+### 2. Partial Signing (Normal Operations)
+
+For V5 (Taproot with MuSig2):
+
+```go
+// Source: libwallet/V5.go:33-62
+func (c *coinV5) SignInput(index int, tx *wire.MsgTx, 
+    userKey *HDPrivateKey, muunKey *HDPublicKey) error {
+    
+    // Derive keys to specific path
+    derivedUserKey, err := userKey.DeriveTo(c.KeyPath)
+    if err != nil {
+        return fmt.Errorf("failed to derive user private key: %w", err)
+    }
+    
+    derivedMuunKey, err := muunKey.DeriveTo(c.KeyPath)
+    if err != nil {
+        return fmt.Errorf("failed to derive muun public key: %w", err)
+    }
+    
+    userEcPriv, err := derivedUserKey.key.ECPrivKey()
+    if err != nil {
+        return fmt.Errorf("failed to obtain ECPrivKey: %w", err)
+    }
+    
+    muunEcPub, err := derivedMuunKey.key.ECPubKey()
+    if err != nil {
+        return fmt.Errorf("failed to obtain ECPubKey: %w", err)
+    }
+    
+    // Calculate signature hash
+    sigHash, err := txscriptw.CalcTaprootSigHash(tx, c.SigHashes, index, 
+        txscript.SigHashAll)
+    if err != nil {
+        return fmt.Errorf("failed to create sigHash: %w", err)
+    }
+    
+    var toSign [32]byte
+    copy(toSign[:], sigHash)
+    
+    return c.signSecondWith(index, tx, userEcPriv, muunEcPub, 
+        c.UserSessionId, toSign)
+}
+```
+
+### 3. MuSig2 Signature Aggregation
+
+MuSig2 combines partial signatures into a single signature:
+
+```go
+// Source: libwallet/V5.go:151-178
+func (c *coinV5) signSecondWith(index int, tx *wire.MsgTx, 
+    userPriv *btcec.PrivateKey, muunPub *btcec.PublicKey,
+    userSessionId [32]byte, toSign [32]byte) error {
+    
+    rawCombinedSig, err := musig.ComputeUserPartialSignature(
+        musig.Musig2v040Muun,
+        toSign[:],
+        userPriv.Serialize(),
+        muunPub.SerializeCompressed(),
+        c.MuunPartialSig[:],
+        c.MuunPubNonce[:],
+        userSessionId[:],
+        musig.KeySpendOnlyTweak(),
+    )
+    if err != nil {
+        return fmt.Errorf("failed to add second signature and combine: %w", err)
+    }
+    
+    sig := append(rawCombinedSig[:], byte(txscript.SigHashAll))
+    
+    tx.TxIn[index].Witness = wire.TxWitness{sig}
+    return nil
+}
+```
+
+<Note>
+MuSig2 requires both parties to exchange **nonces** before signing. This prevents certain attack vectors while enabling signature aggregation.
+</Note>
+
+## Emergency Recovery
+
+If Muun's servers become unavailable, users can recover funds using the **Emergency Kit**:
+
+### Recovery Process
+
+1. **User has**: Recovery code (derived from their seed)
+2. **User obtains**: Muun's public key (embedded in Emergency Kit)
+3. **User can**: Recreate all addresses and sign transactions alone using the recovery tool
+
+```swift
+// Source: falcon/app/falcon/core/Domain/Model/UserAndProfile/KeySet/KeySet.swift
+// KeySet contains both user and Muun public keys for address generation
+public class KeySet {
+    let basePrivateKey: WalletPrivateKey
+    let baseMuunKey: WalletPublicKey
+    // ...
+}
+```
+
+<Warning>
+**Emergency recovery bypasses Muun's servers entirely.** This is the ultimate guarantee of non-custodial control, but requires users to safely backup their recovery code.
+</Warning>
+
+## Security Properties
+
+### What 2-of-2 Multisig Prevents
+
+| Attack Scenario | Protection |
+|----------------|------------|
+| Muun servers compromised | Attacker cannot sign without user's key |
+| User's device stolen | Thief cannot spend without Muun's signature |
+| Malicious transaction from server | Client verifies before signing |
+| Muun goes offline | User can recover with Emergency Kit |
+| User loses device | Can recover with cloud backup + password |
+
+### What Users Must Protect
+
+<CardGroup cols={2}>
+  <Card title="Recovery Code" icon="key">
+    Written down during setup. Enables recovery without Muun.
+  </Card>
+  <Card title="Device Security" icon="mobile">
+    PIN/biometric protects key on device. Should enable device encryption.
+  </Card>
+</CardGroup>
+
+## Comparison to Other Models
+
+| Model | Custody | Recovery | Complexity |
+|-------|---------|----------|------------|
+| **Single-sig** | User only | User responsible | Simple |
+| **Custodial** | Service holds keys | Service controls | Very simple |
+| **2-of-3 multisig** | User + 2 of 3 keys | Flexible options | Complex |
+| **Muun 2-of-2** | Non-custodial | Recovery code always works | Moderate |
+
+## Implementation in Swift
+
+The iOS app bridges to libwallet for signing:
+
+```swift
+// Source: falcon/app/falcon/core/Domain/Model/Transaction/PartiallySignedTransaction.swift
+public class PartiallySignedTransaction {
+    private let inputs: [Input]
+    private let rawTransaction: Data
+    
+    public func sign(with userKey: WalletPrivateKey, 
+                    muunKey: WalletPublicKey) throws -> SignedTransaction {
+        // Calls into libwallet to perform actual signing
+        let libwalletPST = try LibwalletNewPartiallySignedTransaction(
+            inputs, rawTransaction, nonces
+        )
+        
+        let signed = try libwalletPST.sign(userKey.key, muunKey: muunKey.key)
+        return SignedTransaction(from: signed)
+    }
+}
+```
+
+## Best Practices
+
+<Accordion title="For Users">
+- **Write down your recovery code** immediately during setup
+- Store recovery code in a safe place (not on your device)
+- Enable device security features (PIN, biometric, encryption)
+- Consider printing your Emergency Kit for safekeeping
+</Accordion>
+
+<Accordion title="For Developers">
+- Always verify transaction details before calling sign methods
+- Never skip signature verification steps
+- Test recovery flows thoroughly
+- Follow the libwallet API exactly - crypto is unforgiving
+</Accordion>
+
+<Accordion title="For Auditors">
+- Focus on transaction verification logic in `partiallysignedtransaction.go`
+- Review MuSig2 nonce generation for randomness
+- Check that recovery flows don't leak private keys
+- Verify change address generation uses correct derivation paths
+</Accordion>
+
+## Learn More
+
+<CardGroup cols={3}>
+  <Card title="Architecture" href="/concepts/architecture">
+    Overall system design
+  </Card>
+  <Card title="Lightning Network" href="/concepts/lightning-network">
+    How Lightning works with multisig
+  </Card>
+  <Card title="Submarine Swaps" href="/concepts/submarine-swaps">
+    Atomic swaps between layers
+  </Card>
+</CardGroup>

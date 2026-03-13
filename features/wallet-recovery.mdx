@@ -1,0 +1,241 @@
+---
+title: "Wallet Recovery"
+description: "Recover your bitcoin wallet using your Emergency Kit and recovery code"
+---
+
+## Overview
+
+Wallet recovery allows you to restore access to your bitcoin if you lose your device or need to set up Muun on a new phone. The process requires your Emergency Kit and recovery code.
+
+<Warning>
+Wallet recovery is a critical security operation. Make sure you have your legitimate Emergency Kit and recovery code before proceeding.
+</Warning>
+
+## What You Need
+
+To recover your wallet, you'll need:
+
+1. **Emergency Kit PDF** - Contains your encrypted private keys
+2. **Recovery Code** - A 32-character code in format `LABC-DEFG-HIJK-LMNO-PQRS-TUVW-XYZ2-3457`
+3. **Email (optional)** - For faster recovery if you set up email backup
+
+## Recovery Code Format
+
+Recovery codes follow a specific format with version information:
+
+```go
+// Recovery code alphabet (no confusing characters)
+const Alphabet = "ABCDEFHJKLMNPQRSTUVWXYZ2345789"
+
+// Example format: LA + 30 characters split by hyphens
+// L = Muun recovery code
+// A = Version 2 (first character in alphabet)
+```
+
+### Version Support
+
+<Accordion title="Version 2 (Current)">
+  - Starts with `L` + version character
+  - Uses improved character set without confusing letters
+  - More secure key derivation using HMAC-SHA256
+  
+  ```go
+  mac := hmac.New(sha256.New, []byte(kdfKey))
+  mac.Write([]byte(code))
+  input = mac.Sum(nil)
+  ```
+</Accordion>
+
+<Accordion title="Version 1 (Legacy)">
+  - Original recovery code format
+  - Uses scrypt for key derivation
+  - Still supported for backward compatibility
+  
+  ```go
+  input, err = scrypt.Key(
+      []byte(code),
+      saltBytes,
+      512,  // iterations
+      8,    // block size
+      1,    // parallelization factor
+      32,   // output length
+  )
+  ```
+</Accordion>
+
+## Recovery Process
+
+<Steps>
+  <Step title="Install Muun Wallet">
+    Download and install Muun Wallet on your new device from the App Store.
+  </Step>
+  
+  <Step title="Select 'Recover Wallet'">
+    On the welcome screen, choose the option to recover an existing wallet instead of creating a new one.
+  </Step>
+  
+  <Step title="Enter Recovery Code">
+    Input your 32-character recovery code. The app validates the format and version:
+    
+    ```go
+    func Validate(code string) error {
+        _, err := Version(code)
+        return err
+    }
+    
+    func Version(code string) (int, error) {
+        if len(code) != 39 { // 32 RC chars + 7 separator chars
+            return 0, fmt.Errorf("invalid recovery code length %v", len(code))
+        }
+        // Version detection logic...
+    }
+    ```
+  </Step>
+  
+  <Step title="Provide Emergency Kit">
+    Upload or scan your Emergency Kit PDF. The app extracts:
+    - First encrypted key (user key)
+    - Second encrypted key (Muun key)
+    - Key fingerprints
+    - Recovery code checksum
+  </Step>
+  
+  <Step title="Derive Private Keys">
+    The recovery code is converted to a private key that can decrypt your Emergency Kit:
+    
+    ```go
+    func ConvertToKey(code, salt string) (*btcec.PrivateKey, error) {
+        version, err := Version(code)
+        if err != nil {
+            return nil, err
+        }
+        
+        var input []byte
+        switch version {
+        case 1:
+            // Use scrypt for v1 codes
+        case 2:
+            // Use HMAC-SHA256 for v2 codes
+            mac := hmac.New(sha256.New, []byte(kdfKey))
+            mac.Write([]byte(code))
+            input = mac.Sum(nil)
+        }
+        
+        priv, _ := btcec.PrivKeyFromBytes(input)
+        return priv, nil
+    }
+    ```
+  </Step>
+  
+  <Step title="Rebuild Wallet">
+    The app reconstructs your wallet using the decrypted keys and scans the blockchain for your transactions and balance.
+  </Step>
+  
+  <Step title="Set New Security">
+    Once recovered, set up new security measures:
+    - New device PIN/biometrics
+    - Email backup (optional)
+    - Generate new Emergency Kit
+  </Step>
+</Steps>
+
+## Recovery Actions
+
+Muun's recovery system includes specialized actions for different recovery scenarios:
+
+### Recovery Transaction Building
+
+```go
+// Build recovery transaction from Emergency Kit
+type BuildRecoveryTxAction struct {
+    // Constructs transaction from encrypted keys
+}
+
+// Sign the recovery transaction
+type SignRecoveryTxAction struct {
+    // Signs with derived private key
+}
+
+// Broadcast to network
+type BroadcastRecoveryTxAction struct {
+    // Submits to Bitcoin network
+}
+```
+
+These actions are defined in `libwallet/domain/action/recovery/`.
+
+## Common Issues
+
+<Accordion title="Invalid Recovery Code">
+  **Error:** "Invalid recovery code length" or "Invalid recovery code characters"
+  
+  **Solutions:**
+  - Check for typos - use correct alphabet (no O, I, L, 0, 1, 6)
+  - Ensure hyphens are in correct positions (every 4 characters)
+  - Verify the code is exactly 39 characters including hyphens
+  - Check if code starts with 'L' for v2 codes
+</Accordion>
+
+<Accordion title="Emergency Kit Not Readable">
+  **Error:** Cannot parse Emergency Kit PDF
+  
+  **Solutions:**
+  - Ensure PDF is not corrupted
+  - Try downloading a fresh copy from cloud storage
+  - Verify this is your actual Emergency Kit, not a different PDF
+  - Check the kit version matches your recovery code version
+</Accordion>
+
+<Accordion title="Keys Don't Match">
+  **Error:** Recovery code doesn't match Emergency Kit
+  
+  **Solutions:**
+  - Confirm you're using the recovery code from the same wallet
+  - Check if you have multiple Emergency Kits and verify you're using the latest one
+  - Ensure the Emergency Kit hasn't been modified
+</Accordion>
+
+<Accordion title="Recovery Stuck Scanning">
+  **Issue:** Recovery process is taking a long time
+  
+  **This is normal if:**
+  - Your wallet had many transactions
+  - Your wallet is old (more blockchain history to scan)
+  - Network connection is slow
+  
+  The app must scan the entire blockchain history for your addresses, which can take several minutes.
+</Accordion>
+
+## Security Considerations
+
+<Warning>
+Anyone with both your recovery code AND Emergency Kit can access your bitcoin. Keep them secure and separate.
+</Warning>
+
+### Best Practices
+
+- **Store separately**: Keep your recovery code and Emergency Kit in different secure locations
+- **Physical copies**: Consider writing down your recovery code and printing your Emergency Kit
+- **Secure digital storage**: If storing digitally, use encrypted storage
+- **Test recovery**: Verify you can access your backup materials before you need them
+- **Update after changes**: Generate a new Emergency Kit if you change your recovery code
+
+## Advanced Recovery
+
+For advanced users, Muun provides a Recovery Tool for manual recovery:
+
+<Info>
+The Recovery Tool allows you to manually construct and broadcast recovery transactions if the standard recovery flow doesn't work. Access it from the Security Center.
+</Info>
+
+### Recovery Tool Features
+
+- Manual transaction construction
+- Custom fee selection
+- Sweep funds to external address
+- Detailed recovery logs
+
+## Related Features
+
+- [Emergency Kit](/features/emergency-kit) - Learn how to create your Emergency Kit
+- [Security Center](/features/security-center) - Set up comprehensive wallet security

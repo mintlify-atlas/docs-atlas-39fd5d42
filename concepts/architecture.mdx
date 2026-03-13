@@ -1,0 +1,242 @@
+---
+title: Architecture Overview
+description: Understanding the layered architecture of Muun Wallet iOS
+---
+
+## Introduction
+
+Muun Wallet is a **non-custodial 2-of-2 multisig wallet** with a special focus on security and ease of use. The iOS application is built with a clean, layered architecture that separates concerns and enables secure Bitcoin and Lightning Network operations.
+
+## System Architecture
+
+The Muun iOS wallet consists of four primary layers:
+
+<CardGroup cols={2}>
+  <Card title="Presentation Layer" icon="desktop">
+    Contains all UI code and user interface logic
+  </Card>
+  <Card title="Domain Layer" icon="cube">
+    Business logic and use cases following clean architecture principles
+  </Card>
+  <Card title="Data Layer" icon="database">
+    Handles data backends: database, OS services, and network
+  </Card>
+  <Card title="Libwallet" icon="code">
+    Core cryptographic and Bitcoin-specific operations
+  </Card>
+</CardGroup>
+
+### Layer Details
+
+#### Libwallet Core
+
+The `libwallet` module is the heart of Muun's cryptographic operations. Written in Go and bridged using `gomobile`, it handles:
+
+- **Key management and derivation** (HD wallet paths)
+- **Transaction crafting and signing**
+- **Multisig script generation**
+- **Lightning Network operations**
+- **Submarine swap mechanics**
+
+<Note>
+Most security-critical operations happen in libwallet. This module is shared across iOS, Android, and the recovery tool.
+</Note>
+
+```swift
+// Example: Libwallet bridge usage in Swift
+// Source: falcon/app/falcon/core/Extension/Libwallet+Extension.swift
+import Libwallet
+
+public class SubmarineSwap: NSObject {
+    let _swapUuid: String
+    public let _invoice: String
+    public let _receiver: SubmarineSwapReceiver
+    public let _fundingOutput: SubmarineSwapFundingOutput
+    // ...
+}
+```
+
+#### Data Layer
+
+The data layer manages:
+
+- **Secure storage** of keys and sensitive data
+- **Database operations** using GRDB.swift
+- **Network communication** with Muun backend
+- **OS integration** (biometrics, notifications)
+
+```swift
+// Source: falcon/app/falcon/core/Persistence.swift
+// Handles secure local data persistence
+```
+
+#### Domain Layer
+
+Contains the business logic organized into:
+
+- **Actions**: Use cases like `SignChallengeWithUserKeyAction`, `SetupChallengeAction`
+- **Selectors**: Data access patterns like `UserSelector`, `EmergencyKitDataSelector`
+- **Models**: Domain entities like `Transaction`, `SubmarineSwap`, `IncomingSwap`
+- **Services**: Background services like `ReachabilityService`, `FeeBumpFunctionsProvider`
+
+```swift
+// Source: falcon/app/falcon/core/Domain/Model/Operations/SubmarineSwap.swift:62-75
+public func getLightningFeeInSats(onChainFee: BitcoinAmount) -> Satoshis? {
+    guard let debtType = _fundingOutput._debtType,
+          let fees = _fees else {
+        return nil
+    }
+    
+    if debtType == .LEND {
+        return fees._lightning
+    }
+    
+    return fees._lightning + onChainFee.inSatoshis + fees._sweep
+}
+```
+
+## Address Version Evolution
+
+Muun has evolved through multiple address schemes to improve security and reduce fees:
+
+| Version | Type | Description |
+|---------|------|-------------|
+| V1 | P2SH | Single-key legacy addresses |
+| V2 | P2SH | 2-of-2 multisig legacy |
+| V3 | P2WSH | 2-of-2 multisig native SegWit |
+| V4 | P2WSH | Improved native SegWit |
+| V5 | P2TR | Taproot with MuSig2 v0.4.0 |
+| V6 | P2TR | Taproot with MuSig2 v1.0.0 |
+
+```go
+// Source: libwallet/address.go:22-30
+const (
+    AddressVersionV1      = addresses.V1
+    AddressVersionV2      = addresses.V2
+    AddressVersionV3      = addresses.V3
+    AddressVersionV4      = addresses.V4
+    AddressVersionV5      = addresses.V5
+    AddressVersionSwapsV1 = addresses.SubmarineSwapV1
+    AddressVersionSwapsV2 = addresses.SubmarineSwapV2
+)
+```
+
+<Info>
+Newer versions use Taproot (P2TR) with MuSig2 for better privacy and lower fees compared to traditional multisig.
+</Info>
+
+## Key Derivation
+
+Muun uses **BIP32 Hierarchical Deterministic (HD) wallets** for key derivation:
+
+```go
+// Source: libwallet/addresses/addresses.go:37-54
+func Create(version int, userKey, muunKey *hdkeychain.ExtendedKey, 
+            path string, network *chaincfg.Params) (*WalletAddress, error) {
+    switch version {
+    case V1:
+        return CreateAddressV1(userKey, path, network)
+    case V2:
+        return CreateAddressV2(userKey, muunKey, path, network)
+    case V3:
+        return CreateAddressV3(userKey, muunKey, path, network)
+    case V4:
+        return CreateAddressV4(userKey, muunKey, path, network)
+    case V5:
+        return CreateAddressV5(userKey, muunKey, path, network)
+    case V6:
+        return CreateAddressV6(userKey, muunKey, path, network)
+    default:
+        return nil, fmt.Errorf("unknown or unsupported version %v", version)
+    }
+}
+```
+
+Both the user and Muun servers maintain independent key hierarchies that are combined at specific derivation paths to create multisig addresses.
+
+## Transaction Signing Flow
+
+The wallet implements a **partially signed transaction (PST)** model:
+
+1. **Transaction Creation**: Backend creates unsigned transaction
+2. **Verification**: Client verifies outputs, fees, and change addresses
+3. **User Signature**: Client signs with user's private key
+4. **Muun Signature**: Backend adds Muun's signature
+5. **Broadcast**: Fully signed transaction is broadcast to the network
+
+```go
+// Source: libwallet/partiallysignedtransaction.go:186-201
+func (p *PartiallySignedTransaction) Sign(userKey *HDPrivateKey, 
+                                          muunKey *HDPublicKey) (*Transaction, error) {
+    coins, err := p.coins(userKey.Network)
+    if err != nil {
+        return nil, fmt.Errorf("could not convert input data to coin: %w", err)
+    }
+    
+    for i, coin := range coins {
+        err = coin.SignInput(i, p.tx, userKey, muunKey)
+        if err != nil {
+            return nil, fmt.Errorf("failed to sign input: %w", err)
+        }
+    }
+    
+    return newTransaction(p.tx)
+}
+```
+
+<Warning>
+The client **must verify** all transaction details before signing. The verification includes destination address, amount, fees, and change outputs.
+</Warning>
+
+## Security Auditing
+
+For security auditors, focus on these areas:
+
+<CardGroup cols={3}>
+  <Card title="Libwallet Module" icon="lock">
+    Key handling and transaction crafting
+  </Card>
+  <Card title="Data Layer" icon="shield">
+    Secure storage and data handling
+  </Card>
+  <Card title="Domain Layer" icon="check">
+    Business logic that decides when to sign
+  </Card>
+</CardGroup>
+
+## Build Setup
+
+The project uses both Go and Swift:
+
+```bash
+# Install dependencies
+brew install golang
+brew install cocoapods
+brew install docker
+
+# Build libwallet
+cd libwallet/librs && ./makelibs.sh
+
+# Bootstrap gomobile
+tools/bootstrap-gomobile.sh
+
+# Install CocoaPods dependencies
+cd falcon/app && pod install
+
+# Open Xcode workspace
+open falcon/app/falcon.xcworkspace
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Multisig Security" href="/concepts/multisig-security">
+    Learn about the 2-of-2 multisig model
+  </Card>
+  <Card title="Lightning Network" href="/concepts/lightning-network">
+    Understand Lightning integration
+  </Card>
+  <Card title="Submarine Swaps" href="/concepts/submarine-swaps">
+    Explore atomic swaps between layers
+  </Card>
+</CardGroup>

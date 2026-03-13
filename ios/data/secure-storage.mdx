@@ -1,0 +1,549 @@
+---
+title: Secure Storage
+description: High-level secure storage API for cryptographic keys and sensitive data
+---
+
+## Overview
+
+The `SecureStorage` class provides a type-safe, high-level API for storing sensitive data in the iOS Keychain. It wraps `KeychainRepository` with predefined keys and consistent error handling.
+
+## SecureStorage Class
+
+```swift
+public class SecureStorage {
+    
+    enum Errors: Error {
+        case secureStorageError
+        case invalidData
+    }
+    
+    enum Keys: String, CaseIterable {
+        case privateKey
+        case encriptedUserPrivateKey
+        case muunPrivateKey
+        case baseKeyDerivationPath
+        case pin
+        case authToken
+        case pinAttemptsLeft
+        case passwordSalt
+        case recoveryCodeSalt
+        case passwordPublicKey
+        case recoveryCodePublicKey
+        case userKeyPublicKey
+        case passwordVersionKey
+        case recoveryCodeVersionKey
+        case userVersionKey
+    }
+    
+    private let keychainRepository: KeychainRepository
+    
+    public init(keychainRepository: KeychainRepository) {
+        self.keychainRepository = keychainRepository
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/SecureStorage.swift:11`
+
+## Stored Keys
+
+<Tabs>
+  <Tab title="Bitcoin Keys">
+    <ParamField path="privateKey" type="String">
+      User's Bitcoin private key (HD wallet master key)
+    </ParamField>
+    
+    <ParamField path="encriptedUserPrivateKey" type="String">
+      Encrypted version of user's private key
+    </ParamField>
+    
+    <ParamField path="muunPrivateKey" type="String">
+      Muun's co-signing private key for 2-of-2 multisig
+    </ParamField>
+    
+    <ParamField path="baseKeyDerivationPath" type="String">
+      HD wallet derivation path (e.g., "m/44'/0'/0'")
+    </ParamField>
+    
+    <ParamField path="userKeyPublicKey" type="String">
+      User's public key for verification
+    </ParamField>
+  </Tab>
+  
+  <Tab title="Authentication">
+    <ParamField path="authToken" type="String">
+      JWT or session token for API authentication
+    </ParamField>
+    
+    <ParamField path="pin" type="String">
+      User's PIN code for app access
+    </ParamField>
+    
+    <ParamField path="pinAttemptsLeft" type="String">
+      Number of remaining PIN attempts before lockout
+    </ParamField>
+  </Tab>
+  
+  <Tab title="Challenge Keys">
+    <ParamField path="passwordSalt" type="String">
+      Salt for password-based key derivation (PBKDF2)
+    </ParamField>
+    
+    <ParamField path="passwordPublicKey" type="String">
+      Public key derived from user's password
+    </ParamField>
+    
+    <ParamField path="passwordVersionKey" type="String">
+      Version of password encryption scheme
+    </ParamField>
+    
+    <ParamField path="recoveryCodeSalt" type="String">
+      Salt for recovery code key derivation
+    </ParamField>
+    
+    <ParamField path="recoveryCodePublicKey" type="String">
+      Public key derived from recovery code
+    </ParamField>
+    
+    <ParamField path="recoveryCodeVersionKey" type="String">
+      Version of recovery code encryption scheme
+    </ParamField>
+    
+    <ParamField path="userVersionKey" type="String">
+      Version of user key encryption
+    </ParamField>
+  </Tab>
+</Tabs>
+
+## Core Operations
+
+### Store
+
+Store sensitive data:
+
+```swift
+func store(_ string: String, at key: Keys) throws {
+    try keychainRepository.store(string, at: key.rawValue)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/SecureStorage.swift:50`
+
+**Usage:**
+```swift
+let secureStorage = SecureStorage(keychainRepository: keychain)
+
+try secureStorage.store(privateKeyHex, at: .privateKey)
+try secureStorage.store(authToken, at: .authToken)
+try secureStorage.store(pinHash, at: .pin)
+```
+
+### Retrieve
+
+Retrieve stored data:
+
+```swift
+func get(_ key: Keys) throws -> String {
+    return try keychainRepository.get(key.rawValue)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/SecureStorage.swift:54`
+
+**Usage:**
+```swift
+do {
+    let privateKey = try secureStorage.get(.privateKey)
+    let authToken = try secureStorage.get(.authToken)
+    // Use keys
+} catch SecureStorage.Errors.secureStorageError {
+    print("Key not found or access denied")
+} catch SecureStorage.Errors.invalidData {
+    print("Data corrupted")
+}
+```
+
+### Check Existence
+
+Check if a key exists:
+
+```swift
+func has(_ key: Keys) throws -> Bool {
+    return try keychainRepository.has(key.rawValue)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/SecureStorage.swift:58`
+
+**Usage:**
+```swift
+if try secureStorage.has(.privateKey) {
+    print("Wallet initialized")
+} else {
+    print("Need to create wallet")
+}
+```
+
+### Delete
+
+Delete a stored key:
+
+```swift
+func delete(_ key: Keys) {
+    keychainRepository.delete(key.rawValue)
+}
+```
+
+**Usage:**
+```swift
+// Logout: delete auth token
+secureStorage.delete(.authToken)
+
+// Forget PIN
+secureStorage.delete(.pin)
+secureStorage.delete(.pinAttemptsLeft)
+```
+
+### Wipe All
+
+Wipe all secure storage:
+
+```swift
+func wipeAll(preservePin: Bool = false) {
+    keychainRepository.wipe(preservePin: preservePin)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/SecureStorage.swift:42`
+
+**Usage:**
+```swift
+// Complete wipe (logout)
+secureStorage.wipeAll()
+
+// Wipe but keep PIN for convenience
+secureStorage.wipeAll(preservePin: true)
+```
+
+## Usage Patterns
+
+### Wallet Initialization
+
+```swift
+class WalletInitializer {
+    let secureStorage: SecureStorage
+    
+    func createWallet(password: String) throws {
+        // Generate keys
+        let privateKey = generatePrivateKey()
+        let salt = generateSalt()
+        let passwordKey = deriveKey(from: password, salt: salt)
+        
+        // Store keys
+        try secureStorage.store(privateKey.toHex(), at: .privateKey)
+        try secureStorage.store(salt, at: .passwordSalt)
+        try secureStorage.store(passwordKey.publicKey, at: .passwordPublicKey)
+        try secureStorage.store("2", at: .passwordVersionKey)
+        
+        // Store derivation path
+        try secureStorage.store("m/schema:1'/recovery:1'", at: .baseKeyDerivationPath)
+    }
+    
+    func isWalletInitialized() -> Bool {
+        return (try? secureStorage.has(.privateKey)) ?? false
+    }
+}
+```
+
+### Authentication Flow
+
+<CodeGroup>
+```swift Login
+class AuthenticationService {
+    let secureStorage: SecureStorage
+    
+    func login(email: String, password: String) throws -> String {
+        // Authenticate with server
+        let response = try api.login(email: email, password: password)
+        
+        // Store auth token
+        try secureStorage.store(response.token, at: .authToken)
+        
+        return response.token
+    }
+    
+    func getAuthToken() throws -> String {
+        return try secureStorage.get(.authToken)
+    }
+    
+    func isLoggedIn() -> Bool {
+        return (try? secureStorage.has(.authToken)) ?? false
+    }
+}
+```
+
+```swift Logout
+class AuthenticationService {
+    func logout() {
+        // Wipe all secure data
+        secureStorage.wipeAll(preservePin: false)
+        
+        // Also clear preferences
+        preferences.wipeAll()
+    }
+}
+```
+
+```swift PIN Verification
+class PINService {
+    let secureStorage: SecureStorage
+    
+    func verifyPIN(_ pin: String) -> Bool {
+        guard let storedHash = try? secureStorage.get(.pin),
+              let attemptsLeft = try? secureStorage.get(.pinAttemptsLeft).toInt() else {
+            return false
+        }
+        
+        let hash = SHA256.hash(pin)
+        
+        if hash == storedHash {
+            // Correct PIN - reset attempts
+            try? secureStorage.store("5", at: .pinAttemptsLeft)
+            return true
+        } else {
+            // Wrong PIN - decrement attempts
+            let remaining = max(0, attemptsLeft - 1)
+            try? secureStorage.store("\(remaining)", at: .pinAttemptsLeft)
+            
+            if remaining == 0 {
+                // Lock account
+                secureStorage.wipeAll()
+            }
+            
+            return false
+        }
+    }
+}
+```
+</CodeGroup>
+
+### Recovery Flow
+
+```swift
+class RecoveryService {
+    let secureStorage: SecureStorage
+    
+    func setupRecoveryCode(_ code: String) throws {
+        // Derive key from recovery code
+        let salt = generateSalt()
+        let recoveryKey = deriveKey(from: code, salt: salt)
+        
+        // Store recovery data
+        try secureStorage.store(salt, at: .recoveryCodeSalt)
+        try secureStorage.store(recoveryKey.publicKey, at: .recoveryCodePublicKey)
+        try secureStorage.store("1", at: .recoveryCodeVersionKey)
+    }
+    
+    func recoverWallet(recoveryCode: String) throws {
+        // Get recovery salt from server or backup
+        let salt = try secureStorage.get(.recoveryCodeSalt)
+        
+        // Derive key
+        let recoveryKey = deriveKey(from: recoveryCode, salt: salt)
+        
+        // Verify public key matches
+        let storedPublicKey = try secureStorage.get(.recoveryCodePublicKey)
+        guard recoveryKey.publicKey == storedPublicKey else {
+            throw RecoveryError.invalidCode
+        }
+        
+        // Decrypt and restore private key
+        let encryptedKey = try secureStorage.get(.encriptedUserPrivateKey)
+        let privateKey = try decrypt(encryptedKey, with: recoveryKey)
+        
+        try secureStorage.store(privateKey, at: .privateKey)
+    }
+    
+    func hasRecoveryCode() -> Bool {
+        return (try? secureStorage.has(.recoveryCodePublicKey)) ?? false
+    }
+}
+```
+
+### Key Versioning
+
+```swift
+class KeyMigrationService {
+    let secureStorage: SecureStorage
+    
+    func migrateKeysIfNeeded() throws {
+        // Check password key version
+        if let versionString = try? secureStorage.get(.passwordVersionKey),
+           let version = Int(versionString) {
+            
+            if version < 2 {
+                // Migrate from v1 to v2
+                try migratePasswordKeyV1toV2()
+            }
+        }
+        
+        // Check recovery code version
+        if let versionString = try? secureStorage.get(.recoveryCodeVersionKey),
+           let version = Int(versionString) {
+            
+            if version < 2 {
+                // Migrate recovery code
+                try migrateRecoveryCodeV1toV2()
+            }
+        }
+    }
+    
+    private func migratePasswordKeyV1toV2() throws {
+        // Get old key
+        let oldKey = try secureStorage.get(.passwordPublicKey)
+        
+        // Convert to new format
+        let newKey = convertKeyFormat(oldKey)
+        
+        // Store new key
+        try secureStorage.store(newKey, at: .passwordPublicKey)
+        try secureStorage.store("2", at: .passwordVersionKey)
+    }
+}
+```
+
+## Integration with Database Migrations
+
+Secure storage can be accessed during database migrations:
+
+```swift
+migrator.registerMigration("challenge key version migration") { _ in
+    do {
+        if try self.secureStorage.has(.passwordPublicKey) {
+            try self.secureStorage.store("1", at: .passwordVersionKey)
+        }
+        
+        if try self.secureStorage.has(.recoveryCodePublicKey) {
+            try self.secureStorage.store("1", at: .recoveryCodeVersionKey)
+        }
+    } catch {
+        Logger.log(error: error)
+    }
+}
+
+migrator.registerMigration("move base key path to secure storage") { _ in
+    if let path = self.preferences.string(forKey: .baseKeyDerivationPath) {
+        do {
+            try self.secureStorage.store(path, at: .baseKeyDerivationPath)
+            self.preferences.remove(key: .baseKeyDerivationPath)
+        } catch {
+            Logger.log(error: error)
+        }
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Database/DatabaseCoordinator.swift:206`
+
+## Error Handling
+
+### Error Types
+
+<ResponseField name="secureStorageError" type="Error">
+  Key not found, access denied, or keychain operation failed
+</ResponseField>
+
+<ResponseField name="invalidData" type="Error">
+  Stored data is corrupted or cannot be decoded as UTF-8
+</ResponseField>
+
+### Handling Patterns
+
+<CodeGroup>
+```swift Optional Pattern
+func getAuthTokenOptional() -> String? {
+    return try? secureStorage.get(.authToken)
+}
+
+if let token = getAuthTokenOptional() {
+    // Use token
+} else {
+    // Not logged in
+}
+```
+
+```swift Throwing Pattern
+func getAuthToken() throws -> String {
+    return try secureStorage.get(.authToken)
+}
+
+do {
+    let token = try getAuthToken()
+    // Use token
+} catch {
+    // Handle error (show login)
+}
+```
+
+```swift Specific Error Handling
+do {
+    let privateKey = try secureStorage.get(.privateKey)
+    return privateKey
+} catch let error as MuunError {
+    if let storageError = error.kind as? SecureStorage.Errors {
+        switch storageError {
+        case .secureStorageError:
+            // Key not found - wallet not initialized
+            showWalletSetup()
+        case .invalidData:
+            // Data corrupted - recovery needed
+            showRecoveryFlow()
+        }
+    }
+}
+```
+</CodeGroup>
+
+## Security Considerations
+
+<AccordionGroup>
+  <Accordion title="Never Log Keys">
+    Never log private keys, salts, or authentication tokens. Use redacted logging for debugging.
+  </Accordion>
+
+  <Accordion title="Hex Encoding">
+    Store binary data (keys) as hex strings. The keychain stores strings, so encode binary data first.
+  </Accordion>
+
+  <Accordion title="Wipe on Logout">
+    Always wipe secure storage on logout. Optionally preserve PIN for convenience.
+  </Accordion>
+
+  <Accordion title="Version Keys">
+    Store version numbers for cryptographic keys to enable safe migrations.
+  </Accordion>
+
+  <Accordion title="Error Recovery">
+    Handle keychain errors gracefully. Data may be inaccessible due to device lock or corruption.
+  </Accordion>
+</AccordionGroup>
+
+## Best Practices
+
+1. **Type Safety**: Use the `Keys` enum instead of raw strings
+2. **Error Handling**: Always handle errors when accessing secure storage
+3. **Existence Checks**: Check `has()` before `get()` to avoid exceptions
+4. **Atomic Operations**: Store related keys together to maintain consistency
+5. **Cleanup**: Delete keys when no longer needed
+6. **Testing**: Mock secure storage for unit tests
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Keychain" icon="key" href="/ios/data/keychain">
+    Low-level keychain operations
+  </Card>
+  <Card title="Database" icon="database" href="/ios/data/database">
+    Database migrations with secure storage
+  </Card>
+</CardGroup>

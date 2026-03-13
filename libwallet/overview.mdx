@@ -1,0 +1,122 @@
+---
+title: 'Libwallet Overview'
+description: 'Core Go library for Muun Wallet Bitcoin operations'
+---
+
+## Introduction
+
+Libwallet is the core Go library powering Muun Wallet's iOS application. It provides cryptographic primitives, Bitcoin transaction handling, Lightning Network operations, and emergency recovery capabilities.
+
+## Architecture
+
+The library is built using **gomobile** to create iOS-compatible bindings from Go code. This allows Muun to leverage Go's Bitcoin ecosystem while maintaining a native Swift/Objective-C interface.
+
+### Key Components
+
+<CardGroup cols={2}>
+  <Card title="Address Generation" icon="location-dot">
+    Supports 6 address versions (V1-V6) including P2PKH, P2SH, P2WSH, and Taproot
+  </Card>
+  <Card title="Transaction Signing" icon="signature">
+    Multi-signature with MuSig2 for Taproot, 2-of-2 multisig for legacy
+  </Card>
+  <Card title="Lightning Operations" icon="bolt">
+    Invoice parsing, submarine swaps, and HTLC management
+  </Card>
+  <Card title="Emergency Kit" icon="kit-medical">
+    PDF generation with encrypted recovery keys and descriptors
+  </Card>
+</CardGroup>
+
+## Address Versions
+
+Muun has evolved through multiple address schemes to improve security and reduce fees:
+
+| Version | Type | Description |
+|---------|------|-------------|
+| V1 | P2PKH | Legacy single-sig addresses |
+| V2 | P2SH | 2-of-2 multisig wrapped in P2SH |
+| V3 | P2WSH | Native SegWit 2-of-2 multisig |
+| V4 | P2WSH | Native SegWit with SegWit v0 |
+| V5 | P2TR | Taproot with MuSig2 v0.4.0 |
+| V6 | P2TR | Taproot with MuSig2 v1.0.0 |
+
+## Core Features
+
+### Hierarchical Deterministic Keys
+
+All keys are derived using BIP32 hierarchical deterministic key derivation:
+
+```go
+type HDPrivateKey struct {
+    key     hdkeychain.ExtendedKey
+    Network *Network
+    Path    string
+}
+```
+
+### Multi-Party Signing
+
+Muun uses 2-of-2 multi-signature schemes:
+- **User Key**: Controlled by the user's device
+- **Muun Key**: Co-signing key held by Muun servers
+
+This provides both security (requires both signatures) and recovery (Muun can help recover funds).
+
+### Network Support
+
+Libwallet supports both mainnet and testnet:
+
+```go
+const (
+    Mainnet = "mainnet"
+    Testnet = "testnet"
+    Regtest = "regtest"
+)
+```
+
+## Gomobile Bridging
+
+The library uses gomobile to expose Go functions to iOS:
+
+```go
+// Bridge types for iOS interoperability
+type StringList struct {
+    elems []string
+}
+
+type IntList struct {
+    elems []int
+}
+```
+
+These bridge types allow complex data structures to cross the Go-iOS boundary.
+
+## Error Handling
+
+Libwallet defines specific error codes for different scenarios:
+
+```go
+const (
+    ErrInvalidURI = "libwallet.invalid_uri"
+    ErrInvalidInvoice = "libwallet.invalid_invoice"
+    ErrNetwork = "libwallet.network_error"
+)
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Getting Started" icon="play" href="/libwallet/getting-started">
+    Learn how to integrate libwallet into your iOS app
+  </Card>
+  <Card title="Address Generation" icon="location-dot" href="/libwallet/addresses">
+    Generate addresses from V1 to V6
+  </Card>
+  <Card title="Transaction Signing" icon="signature" href="/libwallet/signing">
+    Sign Bitcoin transactions with MuSig2
+  </Card>
+  <Card title="Lightning Network" icon="bolt" href="/libwallet/lightning/invoices">
+    Work with Lightning invoices and swaps
+  </Card>
+</CardGroup>

@@ -1,0 +1,568 @@
+---
+title: 'Lightning Invoices'
+description: 'Parse and validate Lightning Network invoices in Muun Wallet'
+---
+
+## Overview
+
+Libwallet provides comprehensive Lightning invoice parsing using the BOLT 11 specification. It supports unified QR codes with both on-chain and Lightning payment options.
+
+## Invoice Structure
+
+```go
+type Invoice struct {
+    RawInvoice      string
+    FallbackAddress *MuunPaymentURI
+    Network         *Network
+    MilliSat        string
+    Destination     []byte
+    PaymentHash     []byte
+    Expiry          int64
+    Description     string
+    Sats            int64
+}
+```
+
+## Parsing Invoices
+
+### Parse Lightning Invoice
+
+<CodeGroup>
+
+```go Go (libwallet/invoice.go:26)
+func ParseInvoice(
+    rawInput string,
+    network *Network,
+) (*Invoice, error) {
+    _, components := buildUriFromString(rawInput, lightningScheme)
+    if components == nil {
+        return nil, errors.Errorf(ErrInvalidInvoice, "failed to parse uri %v", rawInput)
+    }
+    
+    if components.Scheme != "lightning" {
+        return nil, errors.Errorf(ErrInvalidInvoice, "invalid scheme %v", components.Scheme)
+    }
+    
+    invoice := components.Opaque
+    
+    // When URIs are lightning:// the invoice comes in host
+    if len(invoice) == 0 {
+        invoice = components.Host
+    }
+    
+    parsedInvoice, err := zpay32.Decode(invoice, network.network)
+    if err != nil {
+        return nil, errors.Errorf(ErrInvalidInvoice, "Couldn't parse invoice: %w", err)
+    }
+    
+    var fallbackAdd *MuunPaymentURI
+    if parsedInvoice.FallbackAddr != nil {
+        fallbackAdd, err = GetPaymentURI(
+            parsedInvoice.FallbackAddr.String(),
+            network,
+        )
+        if err != nil {
+            return nil, errors.Errorf(ErrInvalidInvoice, "Couldn't get address: %w", err)
+        }
+    }
+    
+    var description string
+    if parsedInvoice.Description != nil {
+        description = *parsedInvoice.Description
+    }
+    
+    var milliSats string
+    var sats int64
+    if parsedInvoice.MilliSat != nil {
+        milliSat := uint64(*parsedInvoice.MilliSat)
+        milliSats = fmt.Sprintf("%v", milliSat)
+        sats = int64(milliSat / 1000)
+    }
+    
+    return &Invoice{
+        RawInvoice:      invoice,
+        FallbackAddress: fallbackAdd,
+        Network:         network,
+        MilliSat:        milliSats,
+        Destination:     parsedInvoice.Destination.SerializeCompressed(),
+        PaymentHash:     parsedInvoice.PaymentHash[:],
+        Expiry:          parsedInvoice.Timestamp.Unix() + int64(parsedInvoice.Expiry().Seconds()),
+        Description:     description,
+        Sats:            sats,
+    }, nil
+}
+```
+
+```swift iOS
+let invoiceString = "lnbc100n1p3..."
+let network = try! LibwalletNewNetwork("mainnet")
+
+do {
+    let invoice = try LibwalletParseInvoice(invoiceString, network)
+    
+    print("Amount: \(invoice.sats) sats")
+    print("Description: \(invoice.description_)")
+    print("Expires: \(Date(timeIntervalSince1970: TimeInterval(invoice.expiry)))")
+    print("Payment Hash: \(invoice.paymentHash.hexString)")
+    
+    if let fallback = invoice.fallbackAddress {
+        print("Fallback Address: \(fallback.address)")
+    }
+} catch {
+    print("Failed to parse invoice: \(error)")
+}
+```
+
+</CodeGroup>
+
+## Invoice URI Formats
+
+### Lightning URI Scheme
+
+```swift
+let uriFormats = [
+    "lightning:lnbc100n1...",           // Standard
+    "lightning://lnbc100n1...",         // With double slash
+    "LIGHTNING:LNBC100N1...",           // Case insensitive
+    "lnbc100n1...",                     // Raw invoice
+]
+
+for uri in uriFormats {
+    let invoice = try? LibwalletParseInvoice(uri, network)
+    // All formats are supported
+}
+```
+
+## Unified QR Codes
+
+### BIP 21 with Lightning
+
+Unified QR codes combine on-chain and Lightning payment options:
+
+```go
+func GetPaymentURI(
+    rawInput string,
+    network *Network,
+) (*MuunPaymentURI, error) {
+    // Parse bitcoin: URI
+    bitcoinUri, components := buildUriFromString(rawInput, bitcoinScheme)
+    
+    // ...
+    
+    // Check for lightning parameter
+    if strings.ToLower(queryParam) == "lightning" {
+        invoice, err = ParseInvoice(queryValues[queryParam][0], network)
+        if err != nil {
+            return nil, errors.Errorf(ErrInvalidURI, "Couldn't parse query: %v", err)
+        }
+    }
+    
+    return &MuunPaymentURI{
+        Address: address,
+        Label:   label,
+        Message: message,
+        Amount:  amount,
+        Uri:     bitcoinUri,
+        Invoice: invoice,
+    }, nil
+}
+```
+
+### Example Unified QR
+
+<Tabs>
+  <Tab title="Format">
+    ```
+    bitcoin:bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh?
+        amount=0.001&
+        lightning=lnbc1m1pj...
+    ```
+  </Tab>
+  
+  <Tab title="Swift Parsing">
+    ```swift
+    let unifiedQR = """
+    bitcoin:bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh?\
+    amount=0.001&\
+    lightning=lnbc1m1pj...
+    """
+    
+    let paymentURI = try! LibwalletGetPaymentURI(unifiedQR, network)
+    
+    print("On-chain address: \(paymentURI.address)")
+    print("Amount: \(paymentURI.amount) BTC")
+    
+    if let invoice = paymentURI.invoice {
+        print("Lightning available")
+        print("Invoice amount: \(invoice.sats) sats")
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Amount Validation
+
+### Unified QR Amount Matching
+
+When both on-chain and Lightning payment options exist, amounts must match:
+
+```go
+if invoice != nil {
+    if invoice.Sats != 0 {
+        invoiceAmount := decimal.NewFromInt(invoice.Sats).
+            Div(decimal.NewFromInt(100_000_000)).String()
+        
+        // Only mark as invalid if both amounts exist and differ
+        if amount != "" {
+            if invoiceAmount != amount {
+                return nil, errors.New(ErrInvalidURI, "Amount mismatch")
+            }
+        }
+    }
+}
+```
+
+### iOS Amount Validation
+
+```swift
+func validateUnifiedQR(
+    _ paymentURI: LibwalletMuunPaymentURI
+) throws {
+    guard let invoice = paymentURI.invoice else {
+        return // No invoice, nothing to validate
+    }
+    
+    // If invoice has amount, it must match on-chain amount
+    if invoice.sats > 0,
+       let onChainAmount = paymentURI.amount,
+       !onChainAmount.isEmpty {
+        let invoiceAmountBTC = Decimal(invoice.sats) / 100_000_000
+        let onChainAmountBTC = Decimal(string: onChainAmount)
+        
+        guard invoiceAmountBTC == onChainAmountBTC else {
+            throw PaymentError.amountMismatch
+        }
+    }
+}
+```
+
+## Invoice Expiry
+
+### Checking Expiration
+
+```swift
+extension Invoice {
+    var isExpired: Bool {
+        return Date().timeIntervalSince1970 > TimeInterval(expiry)
+    }
+    
+    var timeUntilExpiry: TimeInterval {
+        return TimeInterval(expiry) - Date().timeIntervalSince1970
+    }
+    
+    var expiryDate: Date {
+        return Date(timeIntervalSince1970: TimeInterval(expiry))
+    }
+}
+
+// Usage
+if invoice.isExpired {
+    showError("Invoice has expired")
+} else {
+    let remaining = invoice.timeUntilExpiry
+    print("Expires in \(Int(remaining / 60)) minutes")
+}
+```
+
+## Payment Hash
+
+The payment hash is used to identify and verify Lightning payments:
+
+```swift
+extension Invoice {
+    var paymentHashHex: String {
+        return paymentHash.map { String(format: "%02x", $0) }.joined()
+    }
+    
+    func verifyPreimage(_ preimage: Data) -> Bool {
+        let hash = SHA256.hash(data: preimage)
+        return Data(hash) == paymentHash
+    }
+}
+
+// Usage
+print("Payment hash: \(invoice.paymentHashHex)")
+
+if invoice.verifyPreimage(receivedPreimage) {
+    print("Preimage is valid!")
+}
+```
+
+## Destination Node
+
+The destination is the Lightning node receiving the payment:
+
+```swift
+extension Invoice {
+    var destinationHex: String {
+        return destination.map { String(format: "%02x", $0) }.joined()
+    }
+    
+    var destinationPubKey: Data {
+        return destination
+    }
+}
+
+print("Paying to node: \(invoice.destinationHex)")
+```
+
+## Amount Handling
+
+### MilliSat vs Sat
+
+```swift
+extension Invoice {
+    var amountInMilliSats: UInt64? {
+        guard let milliSatString = milliSat,
+              !milliSatString.isEmpty else {
+            return nil
+        }
+        return UInt64(milliSatString)
+    }
+    
+    var amountInSats: Int64 {
+        return sats
+    }
+    
+    var amountInBTC: Decimal {
+        return Decimal(sats) / 100_000_000
+    }
+    
+    var hasAmount: Bool {
+        return sats > 0
+    }
+}
+
+if let amount = invoice.amountInMilliSats {
+    print("\(amount) msats = \(invoice.amountInSats) sats")
+} else {
+    print("Invoice has no amount (user can specify)")
+}
+```
+
+## Invoice Descriptions
+
+### Description Field
+
+```swift
+extension Invoice {
+    var displayDescription: String {
+        if description_.isEmpty {
+            return "Lightning Payment"
+        }
+        return description_
+    }
+    
+    var descriptionForAccessibility: String {
+        let amount = hasAmount ? "\(sats) sats" : "custom amount"
+        return "Lightning invoice for \(amount). \(displayDescription)"
+    }
+}
+```
+
+## MuunPaymentURI
+
+### Complete Payment URI Structure
+
+```go
+type MuunPaymentURI struct {
+    Address      string
+    Label        string
+    Message      string
+    Amount       string
+    Uri          string
+    Bip70Url     string
+    CreationTime string
+    ExpiresTime  string
+    Invoice      *Invoice
+}
+```
+
+### iOS Helper Extensions
+
+```swift
+extension MuunPaymentURI {
+    var hasLightningOption: Bool {
+        return invoice != nil
+    }
+    
+    var hasOnChainOption: Bool {
+        return !address.isEmpty
+    }
+    
+    var isUnifiedQR: Bool {
+        return hasLightningOption && hasOnChainOption
+    }
+    
+    var preferredPaymentMethod: PaymentMethod {
+        // Prefer Lightning if available and not expired
+        if let invoice = invoice, !invoice.isExpired {
+            return .lightning
+        }
+        return .onChain
+    }
+}
+
+enum PaymentMethod {
+    case onChain
+    case lightning
+}
+```
+
+## Error Handling
+
+### Invoice Errors
+
+```swift
+enum InvoiceError: Error {
+    case invalidFormat
+    case invalidNetwork
+    case expired
+    case amountMismatch
+    case invalidScheme
+    
+    var localizedDescription: String {
+        switch self {
+        case .invalidFormat:
+            return "The invoice format is invalid"
+        case .invalidNetwork:
+            return "This invoice is for a different network"
+        case .expired:
+            return "This invoice has expired"
+        case .amountMismatch:
+            return "On-chain and Lightning amounts don't match"
+        case .invalidScheme:
+            return "Invalid URI scheme"
+        }
+    }
+}
+
+func parseInvoiceSafe(_ invoiceString: String) -> Result<Invoice, InvoiceError> {
+    do {
+        let invoice = try LibwalletParseInvoice(invoiceString, network)
+        
+        if invoice.isExpired {
+            return .failure(.expired)
+        }
+        
+        return .success(invoice)
+    } catch let error as NSError {
+        if error.domain.contains("invalid_invoice") {
+            return .failure(.invalidFormat)
+        }
+        return .failure(.invalidFormat)
+    }
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Always Check Expiry">
+    Lightning invoices expire quickly. Always validate before payment:
+    ```swift
+    guard !invoice.isExpired else {
+        showError("Invoice expired")
+        return
+    }
+    
+    // Show countdown if expiring soon
+    if invoice.timeUntilExpiry < 60 {
+        showExpiryWarning(invoice.timeUntilExpiry)
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Validate Network Match">
+    Ensure invoice matches your network:
+    ```swift
+    guard invoice.network.network == currentNetwork else {
+        throw InvoiceError.invalidNetwork
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Handle Unified QRs Gracefully">
+    Present both payment options to user:
+    ```swift
+    if paymentURI.isUnifiedQR {
+        showPaymentOptions(
+            onChain: paymentURI.address,
+            lightning: paymentURI.invoice,
+            recommended: paymentURI.preferredPaymentMethod
+        )
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Validate Amounts">
+    For unified QRs, validate amount consistency:
+    ```swift
+    func validatePaymentAmount(_ paymentURI: LibwalletMuunPaymentURI) throws {
+        if let invoice = paymentURI.invoice,
+           invoice.sats > 0,
+           let onChainAmt = paymentURI.amount,
+           !onChainAmt.isEmpty {
+            
+            let invoiceBTC = Decimal(invoice.sats) / 100_000_000
+            let onChainBTC = Decimal(string: onChainAmt)
+            
+            guard invoiceBTC == onChainBTC else {
+                throw InvoiceError.amountMismatch
+            }
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Testing
+
+### Test Invoice Parsing
+
+```swift
+func testInvoiceParsing() {
+    let testCases: [(String, Bool)] = [
+        ("lnbc1pvjluezpp5...", true),              // Valid
+        ("lightning:lnbc1pvjluezpp5...", true),   // With scheme
+        ("LNBC1PVJLUEZPP5...", true),              // Case insensitive
+        ("invalid_invoice", false),                // Invalid
+    ]
+    
+    for (invoice, shouldSucceed) in testCases {
+        do {
+            let parsed = try LibwalletParseInvoice(invoice, network)
+            XCTAssertTrue(shouldSucceed, "Expected to fail: \(invoice)")
+        } catch {
+            XCTAssertFalse(shouldSucceed, "Expected to succeed: \(invoice)")
+        }
+    }
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Submarine Swaps" icon="arrows-rotate" href="/libwallet/lightning/swaps">
+    Perform Lightning to on-chain swaps
+  </Card>
+  <Card title="Payment URIs" icon="qrcode" href="/libwallet/addresses">
+    Parse BIP 21 payment URIs
+  </Card>
+  <Card title="Transaction Creation" icon="file-invoice" href="/libwallet/transactions">
+    Build on-chain transactions
+  </Card>
+  <Card title="Fee Estimation" icon="calculator" href="/libwallet/fee-estimation">
+    Calculate transaction fees
+  </Card>
+</CardGroup>

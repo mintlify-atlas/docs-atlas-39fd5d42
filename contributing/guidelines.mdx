@@ -1,0 +1,214 @@
+---
+title: 'Contributing Guidelines'
+description: 'Learn how to contribute to the Muun Wallet iOS app'
+---
+
+## Welcome Contributors
+
+Thank you for your interest in contributing to Muun Wallet! This guide will help you understand our development process and how to submit contributions effectively.
+
+<Note>
+Muun is a non-custodial 2-of-2 multisig wallet with a special focus on security and ease of use. All contributions should maintain these core principles.
+</Note>
+
+## Getting Started
+
+<Steps>
+  <Step title="Fork and Clone">
+    Fork the repository and clone it to your local machine:
+    
+    ```bash
+    git clone https://github.com/your-username/muun-ios.git
+    cd muun-ios
+    ```
+  </Step>
+  
+  <Step title="Set Up Development Environment">
+    Follow the setup instructions in the README:
+    
+    1. Install [golang](https://golang.org/) and set the GOPATH environment variable
+    2. Install [cocoapods](https://guides.cocoapods.org/using/getting-started.html)
+    3. Install [docker](https://docs.docker.com/engine/install/)
+    4. Verify Xcode command line tools are installed (Xcode > Preferences > Locations)
+    5. Run `libwallet/librs/makelibs.sh`
+    6. Run `tools/bootstrap-gomobile.sh`
+    7. Run `cd falcon/app && pod install`
+    8. Open the workspace file in Xcode and build the project
+  </Step>
+  
+  <Step title="Create a Branch">
+    Create a new branch for your feature or bugfix:
+    
+    ```bash
+    git checkout -b feature/your-feature-name
+    ```
+  </Step>
+</Steps>
+
+## Code Style
+
+We use SwiftLint to enforce consistent code style across the project. The configuration is located at `falcon/app/.swiftlint.yml`.
+
+### Key Style Guidelines
+
+**Line Length**
+- Maximum line length: 100 characters
+
+**Function Parameters**
+- Maximum function parameters: 6 (warning threshold)
+
+**Error Handling**
+- Always use explicit error handling with `try` and `catch`
+- Avoid `try?` as it suppresses errors silently
+- Wrap errors using `MuunError(...)` instead of throwing raw errors
+
+<Warning>
+Never use `try?` in your code. Always handle errors explicitly to maintain security and debuggability.
+</Warning>
+
+**Keychain Operations**
+- Always specify `kSecAttrService` and `kSecAttrAccessGroup` when using keychain functions
+- Use the `buildQuery` function unless you have a very good reason not to
+- Never make keychain queries without specifying the access group
+
+**Analytics**
+- Use `logEvent(_ event: AnalyticsEvent)` instead of the legacy string-based API
+
+### Running SwiftLint
+
+Before submitting your code, run SwiftLint to check for style violations:
+
+```bash
+cd falcon/app
+swiftlint
+```
+
+## Project Structure
+
+Understanding the app architecture is crucial for effective contributions:
+
+```
+├── Data Layer       # Database, OS, and network operations
+├── Domain Layer     # Business logic and use cases
+├── Presentation Layer  # UI code
+└── libwallet        # Crypto and Bitcoin-specific code (Go)
+```
+
+<Info>
+Most key handling and transaction crafting happens in the **libwallet** module, written in Go and bridged using gomobile.
+</Info>
+
+### Where to Make Changes
+
+- **Data Layer**: Database operations, secure storage, network calls
+- **Domain Layer**: Business logic that determines when to sign transactions
+- **Presentation Layer**: UI components, view controllers, and user interactions
+- **libwallet**: Cryptographic operations, Bitcoin protocol implementation
+
+## Pull Request Process
+
+<Steps>
+  <Step title="Commit Your Changes">
+    Write clear, descriptive commit messages:
+    
+    ```bash
+    git add .
+    git commit -m "Add support for feature X"
+    ```
+  </Step>
+  
+  <Step title="Push to Your Fork">
+    Push your changes to your forked repository:
+    
+    ```bash
+    git push origin feature/your-feature-name
+    ```
+  </Step>
+  
+  <Step title="Create Pull Request">
+    1. Navigate to the original Muun repository on GitHub
+    2. Click "New Pull Request"
+    3. Select your fork and branch
+    4. Provide a clear title and description of your changes
+    5. Link any related issues
+  </Step>
+  
+  <Step title="Code Review">
+    - Address any feedback from maintainers
+    - Make requested changes in new commits
+    - Push updates to your branch (PR will update automatically)
+  </Step>
+</Steps>
+
+### Pull Request Guidelines
+
+**Title Format**
+- Use clear, descriptive titles
+- Start with a verb (Add, Fix, Update, Refactor)
+- Example: "Fix transaction signing for multisig wallets"
+
+**Description Requirements**
+- Explain what changes you made and why
+- Include screenshots for UI changes
+- Reference related issues using `#issue-number`
+- List any breaking changes
+
+**Before Submitting**
+- Ensure all tests pass
+- Run SwiftLint and fix any violations
+- Update documentation if needed
+- Verify the app builds successfully
+
+<Warning>
+Security-related changes require extra scrutiny. Please be patient during the review process for any changes affecting key handling, transaction signing, or secure storage.
+</Warning>
+
+## Testing
+
+All contributions should include appropriate tests:
+
+- **Unit Tests**: For business logic in the Domain layer
+- **Integration Tests**: For Data layer operations
+- **UI Tests**: For critical user flows
+
+Run tests before submitting:
+
+```bash
+# Run tests in Xcode
+Cmd + U
+```
+
+## Code Review Focus Areas
+
+When auditing contributions, we pay special attention to:
+
+- **Key handling operations** in libwallet
+- **Secure storage and data handling** in the Data layer
+- **Transaction signing logic** in the Domain layer
+- **Error handling** throughout the application
+- **Keychain access** patterns
+
+## License
+
+By contributing to Muun Wallet, you agree that your contributions will be licensed under the MIT License. See the [LICENSE](https://github.com/muun/muun-ios/blob/main/LICENSE) file for details.
+
+<Info>
+The MIT License allows free use, modification, and distribution of the software, making it ideal for open-source collaboration.
+</Info>
+
+## Questions?
+
+If you have questions about contributing:
+
+- Check existing issues and pull requests
+- Review the project README for setup help
+- Open a new issue for discussion before starting major changes
+
+## Community Guidelines
+
+- Be respectful and constructive in all interactions
+- Follow the code of conduct
+- Help others when you can
+- Focus on what is best for the community
+
+Thank you for contributing to Muun Wallet!

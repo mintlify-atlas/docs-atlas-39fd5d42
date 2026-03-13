@@ -1,0 +1,395 @@
+---
+title: "Sending & Receiving Bitcoin"
+description: "Complete guide to sending and receiving bitcoin with Muun Wallet"
+---
+
+## Overview
+
+Muun Wallet provides a seamless experience for sending and receiving bitcoin, supporting both on-chain Bitcoin transactions and Lightning Network payments through a unified interface.
+
+## Receiving Bitcoin
+
+Muun offers flexible receiving options to accommodate different use cases:
+
+### Generate a Receive Address
+
+<Steps>
+  <Step title="Open Receive Screen">
+    Tap the "Receive" button on the home screen to access receiving options.
+  </Step>
+  
+  <Step title="Choose Receive Method">
+    Select between:
+    - **Unified QR** - Supports both Bitcoin and Lightning (recommended)
+    - **Bitcoin address** - On-chain only
+    - **Lightning invoice** - Lightning only
+  </Step>
+  
+  <Step title="Set Amount (Optional)">
+    Add an amount to your receive request. The payer will see this amount when scanning your QR code.
+    
+    ```swift
+    func setAmount(_ bitcoinAmount: BitcoinAmountWithSelectedCurrency?) {
+        advancedOptionsView.setAmount(bitcoinAmount)
+    }
+    ```
+  </Step>
+  
+  <Step title="Share or Display QR Code">
+    - Show the QR code for in-person payments
+    - Copy the address/invoice to share digitally
+    - Use the share button to send via messaging apps
+  </Step>
+</Steps>
+
+### Receive Address Types
+
+Muun supports multiple Bitcoin address formats:
+
+<Accordion title="Native SegWit (bc1...)">
+  - Most efficient format (lowest fees)
+  - Starts with `bc1`
+  - Recommended for most users
+  - Default option in Muun
+</Accordion>
+
+<Accordion title="Compatibility Address (3...)">
+  - P2SH-wrapped SegWit
+  - Starts with `3`
+  - Compatible with older wallets
+  - Available in advanced options
+</Accordion>
+
+<Accordion title="Legacy Address (1...)">
+  - Original Bitcoin address format
+  - Starts with `1`
+  - Higher fees but maximum compatibility
+  - Available in advanced options
+</Accordion>
+
+### Lightning Invoice Features
+
+When receiving via Lightning, Muun generates invoices with built-in expiration:
+
+```swift
+struct IncomingInvoiceInfo {
+    let rawInvoice: String
+    let expiresAt: Double?
+    
+    var expirationTimeInSeconds: Int? {
+        guard let expiresAt = expiresAt else {
+            return nil
+        }
+        return Int(expiresAt - Date().timeIntervalSince1970)
+    }
+}
+```
+
+<Warning>
+Lightning invoices typically expire after 1 hour. You'll need to generate a new invoice if it expires before payment.
+</Warning>
+
+#### Invoice Expiration Handling
+
+The app monitors invoice expiration in real-time:
+
+```swift
+func updateTimer() {
+    guard let expirationTimeRemainingInSecs = invoiceInfo?.expirationTimeInSeconds,
+          let formattedTime = invoiceInfo?.formattedExpirationTime else {
+        return
+    }
+    
+    if expirationTimeRemainingInSecs <= 0 {
+        displayInvoiceExpiredViewAndStopTimer()
+        return
+    }
+    
+    // Show warning when < 3 minutes remaining
+    if expirationTimeRemainingInSecs < expirationMessageThresholdInSecs {
+        setExpirationNoticeHidden(false)
+        updateExpireLabel(formattedTime: formattedTime)
+    }
+}
+```
+
+## Sending Bitcoin
+
+Sending bitcoin in Muun is handled by a sophisticated state machine that guides you through the payment flow:
+
+### Send Flow States
+
+The `NewOperationStateMachine` manages the entire sending process:
+
+<Steps>
+  <Step title="Start - Scan or Paste">
+    Begin by scanning a QR code or pasting a Bitcoin address or Lightning invoice.
+    
+    ```swift
+    func start(uri: String) {
+        do {
+            try stateMachine.withState { (state: NewopStartState) in
+                try state.resolve(uri, network: Environment.current.network)
+            }
+        } catch {
+            Logger.fatal(error: error)
+        }
+    }
+    ```
+  </Step>
+  
+  <Step title="Resolve - Parse Payment Intent">
+    The app determines what type of payment this is:
+    - Bitcoin address payment
+    - Lightning invoice (submarine swap)
+    - LNURL withdraw
+    - Hardware wallet payment
+    
+    ```swift
+    private func handleResolveState(_ state: NewopResolveState) {
+        let paymentIntent = state.paymentIntent!.adapt()
+        
+        switch paymentIntent {
+        case .submarineSwap(let invoice):
+            delegate.setExpires(Double(invoice.expiry))
+        case .toAddress, .toHardwareWallet, .lnurlWithdraw:
+            // Handle accordingly
+        }
+    }
+    ```
+  </Step>
+  
+  <Step title="Enter Amount (if needed)">
+    If the payment request doesn't include an amount, you'll enter it:
+    
+    ```swift
+    func didEnter(amount: BitcoinAmount, 
+                  data: NewOperationStateLoaded, 
+                  takeFeeFromAmount: Bool) {
+        try! stateMachine.withState { (state: NewopEnterAmountState) in
+            let monetaryAmount = amount.inInputCurrency.toLibwallet()
+            try state.enterAmount(monetaryAmount, 
+                                  takeFeeFromAmount: takeFeeFromAmount)
+        }
+    }
+    ```
+  </Step>
+  
+  <Step title="Add Description (optional)">
+    Add a note to help you remember what this payment was for.
+  </Step>
+  
+  <Step title="Validate - Calculate Fees">
+    The app validates the transaction and calculates network fees:
+    
+    ```swift
+    private func handleValidateState(_ state: NewopValidateState) {
+        do {
+            try state.continue()
+        } catch {
+            Logger.fatal(error: error)
+        }
+    }
+    ```
+  </Step>
+  
+  <Step title="Confirm - Review Details">
+    Review the payment details including:
+    - Recipient address
+    - Amount to send
+    - Network fee
+    - Total amount
+    - Fee rate (sats/vByte)
+  </Step>
+  
+  <Step title="Sign and Broadcast">
+    Confirm to sign and broadcast the transaction to the network.
+  </Step>
+</Steps>
+
+### Payment Request Types
+
+Muun handles different payment types internally:
+
+```swift
+private func createPaymentRequestType(_ intent: NewopPaymentIntent) -> PaymentRequestType {
+    switch intent.adapt() {
+    case .toAddress(let uri):
+        return FlowToAddress(uri: uri)
+    case .submarineSwap(let invoice):
+        return FlowSubmarineSwap(invoice: invoice, 
+                                submarineSwapCreated: submarineSwapCreated!)
+    default:
+        Logger.fatal("Could not produce a valid PaymentRequestType: \(intent)")
+    }
+}
+```
+
+## Fee Management
+
+Muun provides flexible fee options for Bitcoin transactions:
+
+### Fee Selection
+
+<Accordion title="Recommended Fee">
+  The default option balances speed and cost. Transactions typically confirm within the next block or two.
+</Accordion>
+
+<Accordion title="Manual Fee Selection">
+  Advanced users can customize their fee rate:
+  
+  ```swift
+  func selected(fee: BitcoinAmount, rate: FeeRate) {
+      try! stateMachine.withState { (state: NewopEditFeeState) in
+          let rateInSatsPerVByte = (rate.satsPerVByte as NSDecimalNumber).doubleValue
+          try state.setFeeRate(rateInSatsPerVByte)
+      }
+  }
+  ```
+  
+  - Measured in satoshis per virtual byte (sat/vB)
+  - Higher fees = faster confirmation
+  - Lower fees = slower confirmation but cheaper
+</Accordion>
+
+<Accordion title="Take Fee from Amount">
+  Option to deduct the network fee from the amount being sent rather than adding it on top.
+  
+  Useful when you want to send your entire balance or a specific amount where the recipient receives slightly less due to fees.
+</Accordion>
+
+### Fee States
+
+The app tracks different fee scenarios:
+
+```swift
+func adapt() -> FeeState {
+    switch state {
+    case NewopFeeStateFinalFee:
+        return .finalFee(amount!.adapt(),
+                        rate: FeeRate(satsPerVByte: Decimal(rateInSatsPerVByte)),
+                        feeBumpInfo: feeBumpInfo?.adapt())
+    case NewopFeeStateNeedsChange:
+        return .feeNeedsChange(
+            displayFee: amount!.adapt(),
+            rate: FeeRate(satsPerVByte: Decimal(rateInSatsPerVByte))
+        )
+    case NewopFeeStateNoPossibleFee:
+        return .noPossibleFee
+    }
+}
+```
+
+## Error Handling
+
+Muun gracefully handles common payment errors:
+
+<Accordion title="Insufficient Balance">
+  ```swift
+  func notEnoughBalance(amountPlusFee: MonetaryAmount, 
+                       totalBalance: MonetaryAmount) {
+      // Show user how much they're short
+      // Offer to adjust amount or fee
+  }
+  ```
+  
+  The app shows exactly how much you're short and suggests adjustments.
+</Accordion>
+
+<Accordion title="Amount Below Dust">
+  ```swift
+  guard operation.amount.inSatoshis >= Satoshis.dust else {
+      delegate.amountBelowDust()
+      return
+  }
+  ```
+  
+  Bitcoin has a minimum amount (dust limit) to prevent spam. Muun prevents you from sending below this threshold.
+</Accordion>
+
+<Accordion title="Invalid Address">
+  ```swift
+  func invalidAddress() {
+      delegate.invalidAddress()
+  }
+  ```
+  
+  The app validates addresses before allowing you to proceed with payment.
+</Accordion>
+
+<Accordion title="Expired Invoice">
+  ```swift
+  func expiredInvoice() {
+      delegate.expiredInvoice()
+  }
+  ```
+  
+  Lightning invoices have expiration times. Request a new invoice from the recipient if this occurs.
+</Accordion>
+
+## Currency Selection
+
+Users can view amounts in their preferred currency:
+
+```swift
+func changeCurrency(_ currency: Currency) {
+    lastSelectedCurrency = currency
+    try! stateMachine.withState { (state: NewopEnterAmountState) in
+        try state.changeCurrency(currency.code)
+    }
+}
+
+func requestCurrencyPicker(data: NewOperationStateLoaded, currency: Currency) {
+    let newOpState = NewOpState.currencyPicker(
+        NewOpData.Amount(
+            type: type,
+            amount: state.amount!.adapt(),
+            primaryCurrency: primaryCurrency,
+            selectedCurrency: lastSelectedCurrency!,
+            totalBalance: totalBalance,
+            exchangeRateWindow: state.resolved!.paymentContext!.exchangeRateWindow!
+        ),
+        selectedCurrency: currency
+    )
+    delegate.requestNextStep(newOpState)
+}
+```
+
+<Note>
+Exchange rates are fetched in real-time and cached. Rates older than the exchange rate window will trigger a refresh.
+</Note>
+
+## Transaction History
+
+All sent and received transactions appear in your transaction list:
+
+- **On-chain transactions**: Show confirmations and block height
+- **Lightning payments**: Instant confirmation
+- **Pending transactions**: Display estimated confirmation time
+- **Failed transactions**: Show reason for failure
+
+## Advanced Features
+
+### Replace-by-Fee (RBF)
+
+For stuck transactions, Muun supports fee bumping:
+
+```swift
+return .finalFee(amount!.adapt(),
+                rate: FeeRate(satsPerVByte: Decimal(rateInSatsPerVByte)),
+                feeBumpInfo: feeBumpInfo?.adapt())
+```
+
+### UTXO Management
+
+Muun automatically manages your UTXOs for optimal fee efficiency:
+
+```swift
+let outpoints: [String] = state.resolved!.paymentContext!.nextTransactionSize!
+    .getOutpoints().split(separator: "\n").map { String($0) }
+```
+
+## Related Features
+
+- [Lightning Payments](/features/lightning-payments) - Learn more about Lightning Network features
+- [Security Center](/features/security-center) - Secure your wallet before transacting

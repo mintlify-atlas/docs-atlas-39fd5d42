@@ -1,0 +1,319 @@
+---
+title: 'Security'
+description: 'Security practices and vulnerability reporting for Muun Wallet'
+---
+
+## Security First
+
+Security is the cornerstone of Muun Wallet. As a non-custodial 2-of-2 multisig Bitcoin wallet, we take the protection of user funds and data extremely seriously.
+
+<Warning>
+Never share private keys, seed phrases, or security vulnerabilities publicly. Always use encrypted communication channels for sensitive information.
+</Warning>
+
+## Responsible Disclosure
+
+If you discover a security vulnerability in Muun Wallet, please report it responsibly. We appreciate the security community's efforts to help keep our users safe.
+
+<Steps>
+  <Step title="Identify the Vulnerability">
+    Before reporting, ensure you have:
+    - A clear understanding of the vulnerability
+    - Steps to reproduce the issue
+    - Potential impact assessment
+    - Any relevant logs or screenshots (with sensitive data removed)
+  </Step>
+  
+  <Step title="Contact the Security Team">
+    Send a detailed report to our security team:
+    
+    **Email**: [security@muun.com](mailto:security@muun.com)
+    
+    <Note>
+    For sensitive vulnerabilities, please encrypt your email using our PGP public key (details below).
+    </Note>
+  </Step>
+  
+  <Step title="Wait for Acknowledgment">
+    Our security team will:
+    - Acknowledge receipt of your report within 48 hours
+    - Begin investigating the issue
+    - Keep you informed about the progress
+  </Step>
+  
+  <Step title="Coordinated Disclosure">
+    Please allow time for:
+    - Verification and assessment of the vulnerability
+    - Development and testing of a fix
+    - Deployment to production
+    - Public disclosure (if appropriate)
+  </Step>
+</Steps>
+
+## PGP Encryption
+
+For reporting critical security vulnerabilities, we strongly recommend encrypting your email using our PGP public key.
+
+### PGP Public Key Details
+
+**Fingerprint**: `1299 28C1 E79F E011 6DA4 C80F 8DB7 FD0F 61E6 ED76`
+
+<Info>
+You can find our complete PGP public key on major keyservers or by contacting our security team.
+</Info>
+
+### How to Use PGP Encryption
+
+```bash
+# Import the Muun security team's public key
+gpg --keyserver keys.openpgp.org --recv-keys 1299-28C1-E79F-E011-6DA4-C80F-8DB7-FD0F-61E6-ED76
+
+# Encrypt your message
+gpg --encrypt --armor --recipient security@muun.com message.txt
+
+# Send the encrypted message via email
+```
+
+## What to Report
+
+We are interested in vulnerabilities that could compromise:
+
+### Critical Security Areas
+
+**Key Management**
+- Private key generation vulnerabilities
+- Key storage weaknesses
+- Key derivation issues
+- Exposure of seed phrases or mnemonics
+
+**Transaction Security**
+- Transaction signing bypasses
+- Signature validation issues
+- Address generation vulnerabilities
+- Fee manipulation attacks
+
+**Cryptographic Issues**
+- Weak random number generation
+- Improper use of cryptographic primitives
+- Side-channel attacks
+- Implementation flaws in libwallet
+
+**Data Protection**
+- Keychain security bypasses
+- Insecure data storage
+- Information leakage
+- Backup security issues
+
+**Network Security**
+- Man-in-the-middle attack vectors
+- API authentication bypasses
+- Certificate validation issues
+- Network data exposure
+
+<Warning>
+Vulnerabilities in any of these areas could lead to loss of user funds. Please report them immediately.
+</Warning>
+
+## Security Architecture
+
+Understanding Muun's security architecture helps identify potential vulnerabilities:
+
+### Three-Layer Security Model
+
+```
+libwallet (Go)
+├── Key handling
+├── Transaction crafting
+├── Cryptographic operations
+└── Bitcoin protocol implementation
+
+Data Layer
+├── Secure storage (Keychain)
+├── Database encryption
+├── Network communication
+└── Operating system integration
+
+Domain Layer
+├── Business logic
+├── Transaction signing decisions
+├── Multisig coordination
+└── Recovery procedures
+```
+
+### Key Security Features
+
+**2-of-2 Multisig**
+- User key stored on device
+- Server key managed by Muun
+- Both signatures required for transactions
+- Enhanced security and recovery options
+
+**Secure Storage**
+- iOS Keychain for sensitive data
+- Hardware security module integration
+- Encrypted database
+- Secure memory handling
+
+**Network Security**
+- TLS/SSL for all communications
+- Certificate pinning
+- API authentication
+- Request signing
+
+## Code Audit Guidelines
+
+When reviewing code for security issues, focus on:
+
+### High-Priority Areas
+
+**libwallet Module**
+- Most key handling operations occur here
+- Transaction crafting and signing
+- Cryptographic primitive usage
+- Random number generation
+
+**Data Layer**
+- Keychain operations (always check for `kSecAttrService` and `kSecAttrAccessGroup`)
+- Database queries and storage
+- Network request/response handling
+- File system operations
+
+**Domain Layer**
+- Authorization checks before signing
+- Transaction validation logic
+- Recovery flow security
+- State management
+
+### Code Patterns to Avoid
+
+<Warning>
+The following patterns are explicitly forbidden and may indicate security vulnerabilities:
+</Warning>
+
+**Suppressed Error Handling**
+```swift
+// ❌ FORBIDDEN: try? suppresses errors
+let result = try? sensitiveOperation()
+
+// ✅ CORRECT: Explicit error handling
+do {
+    let result = try sensitiveOperation()
+} catch {
+    throw MuunError(error)
+}
+```
+
+**Unsafe Keychain Access**
+```swift
+// ❌ FORBIDDEN: Missing access group
+SecItemCopyMatching(query, &result)
+
+// ✅ CORRECT: Use buildQuery with proper attributes
+let query = buildQuery(service: "...", accessGroup: "...")
+SecItemCopyMatching(query, &result)
+```
+
+## Security Testing
+
+Contributors should test for common security issues:
+
+### Testing Checklist
+
+- [ ] No hardcoded secrets or keys
+- [ ] Proper error handling for all cryptographic operations
+- [ ] Keychain queries include access group
+- [ ] Sensitive data cleared from memory after use
+- [ ] Network requests use secure protocols
+- [ ] Input validation for all user data
+- [ ] No logging of sensitive information
+
+## Vulnerability Disclosure Timeline
+
+Our typical response timeline:
+
+1. **Initial Response**: Within 48 hours of report
+2. **Triage & Assessment**: 1-5 business days
+3. **Fix Development**: Varies by severity (1-30 days)
+4. **Testing & QA**: 3-7 days
+5. **Deployment**: Coordinated with reporter
+6. **Public Disclosure**: 30-90 days after fix deployment
+
+<Info>
+Timelines may vary based on vulnerability severity and complexity. Critical vulnerabilities receive expedited attention.
+</Info>
+
+## Bug Bounty Program
+
+While we don't currently have a formal bug bounty program, we deeply appreciate security researchers who help protect our users. We evaluate each submission individually and may offer rewards for significant findings.
+
+## Security Updates
+
+Stay informed about security updates:
+
+- Monitor GitHub releases for security patches
+- Follow security advisories when published
+- Keep your Muun Wallet app updated
+- Subscribe to our announcement channels
+
+## Best Practices for Contributors
+
+When contributing code to Muun:
+
+<Steps>
+  <Step title="Follow Secure Coding Standards">
+    - Use SwiftLint configuration
+    - Implement proper error handling
+    - Never suppress errors with `try?`
+    - Follow keychain best practices
+  </Step>
+  
+  <Step title="Review Your Changes">
+    - Check for hardcoded secrets
+    - Verify cryptographic operations
+    - Test error paths
+    - Review keychain usage
+  </Step>
+  
+  <Step title="Document Security Implications">
+    - Note any security-relevant changes in PR description
+    - Explain authorization logic
+    - Document key handling modifications
+    - Highlight any cryptographic changes
+  </Step>
+  
+  <Step title="Request Security Review">
+    - Tag security-critical PRs appropriately
+    - Request review from security-focused maintainers
+    - Be patient during extended review periods
+    - Address all security feedback
+  </Step>
+</Steps>
+
+## License and Legal
+
+Muun Wallet is released under the MIT License, which provides:
+
+- Freedom to use, modify, and distribute
+- No warranty (express or implied)
+- Liability limitations
+
+<Note>
+By contributing, you agree that your code will be licensed under the same MIT License. See the [LICENSE](https://github.com/muun/muun-ios/blob/main/LICENSE) file for full terms.
+</Note>
+
+## Additional Resources
+
+- [Muun Security White Paper](https://muun.com/security)
+- [Bitcoin Security Best Practices](https://bitcoin.org/en/secure-your-wallet)
+- [iOS Security Guide](https://support.apple.com/guide/security/welcome/web)
+- [OWASP Mobile Security](https://owasp.org/www-project-mobile-security/)
+
+## Contact
+
+For non-vulnerability security questions or general inquiries:
+
+- **Security Reports**: [security@muun.com](mailto:security@muun.com) (use PGP for sensitive info)
+- **General Questions**: Open an issue on GitHub
+- **Website**: [muun.com](https://muun.com)
+
+Thank you for helping keep Muun Wallet secure!

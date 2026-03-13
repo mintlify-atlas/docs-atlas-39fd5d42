@@ -1,0 +1,129 @@
+---
+title: Introduction
+description: Welcome to Muun Wallet - A non-custodial Bitcoin and Lightning wallet for iOS
+---
+
+# Welcome to Muun Wallet
+
+Muun is a **non-custodial 2-of-2 multisig Bitcoin and Lightning wallet** for iOS, designed with a focus on security and ease of use. This documentation covers the iOS application architecture, the underlying libwallet core library, and guides for developers contributing to the project.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get up and running with Muun Wallet development
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the 2-of-2 multisig security model
+  </Card>
+  <Card title="iOS SDK" icon="mobile" href="/ios/overview">
+    Explore the iOS app architecture
+  </Card>
+  <Card title="Libwallet" icon="code" href="/libwallet/overview">
+    Learn about the Go core library
+  </Card>
+</CardGroup>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="2-of-2 Multisig Security" icon="shield-halved">
+    User and server co-sign every transaction for enhanced security
+  </Card>
+  <Card title="Lightning Network" icon="bolt">
+    Send and receive instant, low-fee Lightning payments
+  </Card>
+  <Card title="Submarine Swaps" icon="arrows-rotate">
+    Seamlessly move funds between on-chain and Lightning
+  </Card>
+  <Card title="Emergency Kit" icon="life-ring">
+    Recover your funds even if Muun servers go offline
+  </Card>
+</CardGroup>
+
+## Architecture Overview
+
+Muun Wallet is built with three main components:
+
+### iOS Application (Swift)
+
+The iOS app follows clean architecture principles with three distinct layers:
+
+- **Data Layer** - Handles database, keychain, secure storage, and network operations
+- **Domain Layer** - Contains business logic, models, and use cases
+- **Presentation Layer** - Manages UI components and user interactions
+
+### Libwallet (Go)
+
+The core cryptographic and Bitcoin-specific logic is written in Go and bridged to iOS using gomobile:
+
+- Address generation and derivation
+- Transaction creation and signing
+- Fee estimation
+- Lightning Network operations
+- Emergency Kit generation and recovery
+- MuSig2 cryptographic operations
+
+### Prover (Rust)
+
+Advanced cryptographic proofs using plonky2 for zero-knowledge validation.
+
+## Security Model
+
+Muun uses a **2-of-2 multisig** setup where:
+
+1. **User key** - Generated and stored securely on your device
+2. **Server key** - Held by Muun's cosigning server
+
+Both keys are required to sign transactions, providing:
+
+- Protection against server compromise (server cannot spend your funds alone)
+- Recovery options via the Emergency Kit if the server becomes unavailable
+- No single point of failure
+
+<Note>
+The Emergency Kit allows you to recover your funds unilaterally using only your device and recovery code, even if Muun's servers are permanently offline.
+</Note>
+
+## Non-Custodial Design
+
+Muun is **non-custodial**, meaning:
+
+- You control your private keys
+- Muun cannot access or move your funds without your participation
+- Your funds remain yours at all times
+- The Emergency Kit provides a fallback recovery mechanism
+
+## Getting Started
+
+<Steps>
+  <Step title="Set up your development environment">
+    Follow the [Installation guide](/installation) to install dependencies and set up the project
+  </Step>
+  <Step title="Explore the architecture">
+    Learn about the [iOS app structure](/ios/architecture-layers) and [libwallet core](/libwallet/overview)
+  </Step>
+  <Step title="Build and run">
+    Follow the [Building guide](/development/building) to compile and run the wallet
+  </Step>
+</Steps>
+
+## Open Source
+
+Muun Wallet is open source under the MIT license. The source code is available on [GitHub](https://github.com/muun/falcon).
+
+<Info>
+For security vulnerabilities, please email [security@muun.com](mailto:security@muun.com). You can encrypt your message using Muun's PGP key: `1299 28C1 E79F E011 6DA4 C80F 8DB7 FD0F 61E6 ED76`
+</Info>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Quickstart" icon="play" href="/quickstart">
+    Build and run the wallet
+  </Card>
+  <Card title="Features" icon="stars" href="/features/emergency-kit">
+    Explore wallet features
+  </Card>
+  <Card title="Contributing" icon="code-pull-request" href="/contributing/guidelines">
+    Contribute to the project
+  </Card>
+</CardGroup>

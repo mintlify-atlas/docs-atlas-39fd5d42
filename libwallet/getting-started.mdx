@@ -1,0 +1,248 @@
+---
+title: 'Getting Started with Libwallet'
+description: 'Integrate Muun Wallet libwallet into your iOS application'
+---
+
+## Installation
+
+Libwallet is compiled to an iOS framework using **gomobile bind**:
+
+```bash
+gomobile bind -target=ios -o Libwallet.framework github.com/muun/libwallet
+```
+
+This generates a `.framework` file that can be imported into your Xcode project.
+
+## Importing into iOS
+
+### Add Framework to Xcode
+
+1. Drag `Libwallet.framework` into your Xcode project
+2. Ensure it's added to "Embedded Binaries" in your target settings
+3. Import in Swift:
+
+```swift
+import Libwallet
+```
+
+### Objective-C Import
+
+```objc
+#import <Libwallet/Libwallet.h>
+```
+
+## Basic Setup
+
+### Initialize Network
+
+First, create a network instance for mainnet or testnet:
+
+<CodeGroup>
+
+```swift Swift
+let network = try! LibwalletNewNetwork("mainnet")
+```
+
+```objc Objective-C
+NSError *error = nil;
+LibwalletNetwork *network = LibwalletNewNetwork(@"mainnet", &error);
+if (error != nil) {
+    NSLog(@"Failed to create network: %@", error);
+}
+```
+
+</CodeGroup>
+
+### Generate HD Keys
+
+Create hierarchical deterministic keys from a mnemonic:
+
+```swift
+// Generate a new recovery code
+let recoveryCode = LibwalletGenerateRecoveryCode()
+
+// Create a challenge private key from recovery code
+let salt = "muun"
+let challengeKey = try! LibwalletRecoveryCodeToKey(recoveryCode, salt)
+
+// Derive user key from challenge key
+let userKey = try! challengeKey.deriveKey("m/schema:1'/recovery:1'")
+```
+
+## Creating Your First Address
+
+### V5 Taproot Address (Recommended)
+
+Generate a modern Taproot address using MuSig2:
+
+```swift
+let userPublicKey: LibwalletHDPublicKey = // derived from user seed
+let muunPublicKey: LibwalletHDPublicKey = // provided by server
+
+let address = try! LibwalletCreateAddressV5(
+    userPublicKey,
+    muunPublicKey
+)
+
+print("Address: \(address.address())")
+print("Path: \(address.derivationPath())")
+print("Version: \(address.version())")
+```
+
+### V4 SegWit Address
+
+For compatibility with older versions:
+
+```swift
+let address = try! LibwalletCreateAddressV4(
+    userPublicKey,
+    muunPublicKey
+)
+```
+
+## Working with Transactions
+
+### Parse a Payment URI
+
+Libwallet can parse Bitcoin URIs (BIP21) and Lightning invoices:
+
+<Tabs>
+  <Tab title="Bitcoin URI">
+    ```swift
+    let uri = "bitcoin:bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh?amount=0.001&label=Coffee"
+    let paymentURI = try! LibwalletGetPaymentURI(uri, network)
+    
+    print("Address: \(paymentURI.address)")
+    print("Amount: \(paymentURI.amount)")
+    print("Label: \(paymentURI.label)")
+    ```
+  </Tab>
+  <Tab title="Lightning Invoice">
+    ```swift
+    let invoice = "lnbc..."
+    let parsed = try! LibwalletParseInvoice(invoice, network)
+    
+    print("Amount: \(parsed.sats) sats")
+    print("Description: \(parsed.description_)")
+    print("Expiry: \(parsed.expiry)")
+    ```
+  </Tab>
+</Tabs>
+
+## Signing Transactions
+
+### Create Partially Signed Transaction
+
+```swift
+// Create input list
+let inputs = LibwalletInputList()
+// Add inputs...
+
+// Create nonces for MuSig2
+let nonces = LibwalletNewMusigNonces()
+for _ in 0..<inputs.inputs().count {
+    let sessionId = generateRandomBytes(32)
+    nonces.add(sessionId)
+}
+
+// Create PST from raw transaction
+let pst = try! LibwalletNewPartiallySignedTransaction(
+    inputs,
+    rawTxBytes,
+    nonces
+)
+```
+
+### Sign with User Key
+
+```swift
+let userPrivateKey: LibwalletHDPrivateKey = // user's private key
+let muunPublicKey: LibwalletHDPublicKey = // server's public key
+
+let signedTx = try! pst.sign(userPrivateKey, muunPublicKey)
+
+print("Transaction Hash: \(signedTx.hash)")
+print("Raw TX: \(signedTx.bytes.hexEncodedString())")
+```
+
+## Error Handling
+
+All libwallet functions that can fail throw errors in Swift:
+
+```swift
+do {
+    let address = try LibwalletCreateAddressV6(userKey, muunKey)
+    print("Generated: \(address.address())")
+} catch let error as NSError {
+    print("Error: \(error.localizedDescription)")
+    print("Domain: \(error.domain)")
+}
+```
+
+## Memory Management
+
+Gomobile handles reference counting automatically. Objects returned from libwallet are automatically released when no longer referenced:
+
+```swift
+func createAddress() -> String {
+    let address = try! LibwalletCreateAddressV5(userKey, muunKey)
+    return address.address()
+    // address object is automatically released here
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Use Latest Address Version">
+    Always use V6 (Taproot with MuSig2 v1.0.0) for new addresses. It provides the best privacy and lowest fees.
+  </Accordion>
+  
+  <Accordion title="Validate Payment URIs">
+    Always validate URIs before displaying to users:
+    ```swift
+    guard let paymentURI = try? LibwalletGetPaymentURI(input, network) else {
+        showError("Invalid payment URI")
+        return
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Store Recovery Code Securely">
+    The recovery code is the master seed. Store it encrypted in the iOS Keychain:
+    ```swift
+    let recoveryCode = LibwalletGenerateRecoveryCode()
+    KeychainWrapper.standard.set(recoveryCode, forKey: "recovery_code")
+    ```
+  </Accordion>
+  
+  <Accordion title="Handle Network Errors">
+    Always handle network-related errors gracefully:
+    ```swift
+    do {
+        let result = try LibwalletDoPaymentRequestCall(bip70URL, network)
+    } catch let error as NSError {
+        if error.domain == "libwallet.network_error" {
+            showRetryDialog()
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Address Generation" icon="location-dot" href="/libwallet/addresses">
+    Deep dive into all 6 address versions
+  </Card>
+  <Card title="Transaction Building" icon="screwdriver-wrench" href="/libwallet/transactions">
+    Create and validate Bitcoin transactions
+  </Card>
+  <Card title="MuSig2 Signing" icon="key" href="/libwallet/signing">
+    Understand multi-party Taproot signatures
+  </Card>
+  <Card title="Emergency Kit" icon="kit-medical" href="/libwallet/emergency-kit/generation">
+    Generate PDF recovery kits
+  </Card>
+</CardGroup>

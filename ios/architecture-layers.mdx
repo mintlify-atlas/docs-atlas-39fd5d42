@@ -1,0 +1,437 @@
+---
+title: Architecture Layers
+description: Detailed explanation of the three-layer architecture in Muun iOS app
+---
+
+## Overview
+
+The Muun iOS app implements a clean three-layer architecture that separates concerns and promotes maintainability, testability, and scalability.
+
+## Architecture Diagram
+
+```swift
+┌─────────────────────────────────────────────────────────┐
+│               PRESENTATION LAYER                        │
+│                                                         │
+│  MUViewController → MUView → UI Components             │
+│      ↓                                                  │
+│  Observe: Observable<Model>                            │
+│  Actions: User Events → Presenter/ViewController       │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     ↓ (Dependency Injection)
+┌─────────────────────────────────────────────────────────┐
+│                 DOMAIN LAYER                            │
+│                                                         │
+│  AsyncAction<T> → Business Logic → Domain Models       │
+│      ↓                                                  │
+│  Services: Crypto, Selectors, Sync                     │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     ↓ (Repository Pattern)
+┌─────────────────────────────────────────────────────────┐
+│                  DATA LAYER                             │
+│                                                         │
+│  Repositories → Database (GRDB) + Keychain + Network   │
+│      ↓                                                  │
+│  Observable<Data> via RxSwift                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Layer Details
+
+### Presentation Layer
+
+<Tabs>
+  <Tab title="Responsibilities">
+    - Display data to users
+    - Handle user interactions
+    - Navigate between screens
+    - Show loading states and errors
+    - Format data for display
+  </Tab>
+  <Tab title="Key Components">
+    - `MUViewController`: Base view controller
+    - `MUView`: Base view class
+    - Screen-specific ViewControllers
+    - Reusable UI Components
+    - Presenters (in some screens)
+  </Tab>
+  <Tab title="Example">
+    ```swift
+class HomeViewController: MUViewController {
+    
+    private let presenter: HomePresenter
+    private let disposeBag = DisposeBag()
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        
+        // Subscribe to domain layer observables
+        presenter.watchUser()
+            .subscribe(onNext: { [weak self] user in
+                self?.updateUI(with: user)
+            })
+            .disposed(by: disposeBag)
+    }
+    
+    // Handle user actions
+    @objc func onSendTapped() {
+        let vc = NewOperationViewController()
+        pushTo(vc)
+    }
+}
+    ```
+  </Tab>
+</Tabs>
+
+#### Base View Controller
+
+All view controllers extend `MUViewController`:
+
+```swift
+class MUViewController: UIViewController {
+    var loadingView: LoadingView?
+    var toast: ToastView?
+    
+    func showLoading(_ text: String) {
+        // Show loading overlay
+    }
+    
+    func dismissLoading() {
+        // Hide loading overlay
+    }
+    
+    func showToast(message: String) {
+        // Show temporary message
+    }
+}
+```
+
+**Key Features:**
+- Consistent navigation styling
+- Loading state management
+- Toast notifications
+- Keyboard handling
+- Lifecycle logging
+
+### Domain Layer
+
+<Tabs>
+  <Tab title="Responsibilities">
+    - Implement business logic
+    - Define domain models
+    - Execute use cases
+    - Coordinate between data sources
+    - Apply business rules
+  </Tab>
+  <Tab title="Key Components">
+    - `AsyncAction<T>`: Use case pattern
+    - Domain Models (User, Operation, etc.)
+    - Domain Services
+    - Selectors for complex queries
+    - Cryptographic operations
+  </Tab>
+  <Tab title="Example">
+    ```swift
+// Use case pattern with AsyncAction
+class FetchUserAction: AsyncAction<User> {
+    
+    private let userRepository: UserRepository
+    private let houstonService: HoustonService
+    
+    init(name: String, 
+         userRepository: UserRepository,
+         houstonService: HoustonService) {
+        self.userRepository = userRepository
+        self.houstonService = houstonService
+        super.init(name: name)
+    }
+    
+    func run() {
+        let single = houstonService.fetchUser()
+            .do(onSuccess: { user in
+                self.userRepository.setUser(user)
+            })
+        
+        runSingle(single)
+    }
+}
+    ```
+  </Tab>
+</Tabs>
+
+#### AsyncAction Pattern
+
+The `AsyncAction<T>` class provides a reactive use case pattern:
+
+```swift
+public class AsyncAction<T>: NSObject {
+    
+    private let name: String
+    private let subject: BehaviorSubject<ActionState<T>>
+    
+    init(name: String) {
+        self.name = name
+        self.subject = BehaviorSubject(value: ActionState.createEmpty())
+        super.init()
+    }
+    
+    func runSingle(_ single: Single<T>) {
+        // Manages loading, success, and error states
+    }
+    
+    public func getState() -> Observable<ActionState<T>> {
+        // Returns observable of action states
+    }
+    
+    public func getValue() -> Single<T> {
+        // Returns single value when action completes
+    }
+}
+```
+
+**Action States:**
+- `EMPTY`: Initial state
+- `LOADING`: Operation in progress
+- `VALUE`: Success with result
+- `ERROR`: Failure with error
+
+#### Domain Models
+
+Domain models represent business entities:
+
+```swift
+public struct Operation {
+    public let id: Int?
+    public let requestId: String
+    public let direction: OperationDirection
+    public let amount: BitcoinAmount
+    public let fee: BitcoinAmount
+    public var status: OperationStatus
+    public let creationDate: Date
+    public var submarineSwap: SubmarineSwap?
+    public let incomingSwap: IncomingSwap?
+    
+    public func isCancelable() -> Bool {
+        return transaction?.isReplaceableByFee ?? false
+            && isPending()
+    }
+    
+    public func totalFeeInSatoshis() -> Satoshis {
+        return fee.inSatoshis + offChainFeeInSatoshis()
+    }
+}
+
+public enum OperationStatus: String, Codable {
+    case CREATED
+    case SIGNING
+    case SIGNED
+    case BROADCASTED
+    case CONFIRMED
+    case SETTLED
+    case FAILED
+}
+```
+
+### Data Layer
+
+<Tabs>
+  <Tab title="Responsibilities">
+    - Persist data locally (database)
+    - Store secure data (keychain)
+    - Communicate with backend API
+    - Cache data for offline use
+    - Provide reactive data streams
+  </Tab>
+  <Tab title="Key Components">
+    - Repositories (Repository Pattern)
+    - Database Coordinator (GRDB)
+    - Network Services
+    - Secure Storage
+    - Preferences (UserDefaults)
+  </Tab>
+  <Tab title="Example">
+    ```swift
+class OperationRepository: BaseDatabaseRepository<OperationDB, Operation> {
+    
+    func storeOperations(_ operations: [Operation]) -> Completable {
+        return write(objects: operations)
+    }
+    
+    func watchOperations() -> Observable<[Operation]> {
+        return OperationDB.all()
+            .rx
+            .observeAll(in: queue)
+            .map { objects in
+                try objects.map { try $0.to(using: db) }
+            }
+    }
+    
+    func hasPendingOperations() -> Bool {
+        let query = OperationDB
+            .filter(pendingStates.contains(Column("status")))
+        return exists(query: query)
+    }
+}
+    ```
+  </Tab>
+</Tabs>
+
+#### Repository Pattern
+
+Repositories abstract data access:
+
+```swift
+class BaseDatabaseRepository<T, M> where T: DatabaseModel {
+    
+    let queue: DatabaseQueue
+    
+    func write(objects: [M]) -> Completable {
+        return Completable.deferred({
+            try self.queue.write { (db) in
+                for object in objects {
+                    try T(from: object).save(db)
+                }
+            }
+            return Completable.empty()
+        })
+    }
+    
+    func watchObjects() -> Observable<[M]> {
+        return T.all()
+            .rx
+            .observeAll(in: queue)
+            .map { objects in
+                try objects.map { try $0.to(using: db) }
+            }
+    }
+}
+```
+
+## Data Flow
+
+### Read Flow (Bottom-Up)
+
+```swift
+1. Data Layer: Database emits changes via Observable
+   └─> Repository.watchOperations() -> Observable<[Operation]>
+
+2. Domain Layer: Transform and apply business logic
+   └─> Selector/Service processes data
+
+3. Presentation Layer: View Controller subscribes
+   └─> Update UI with latest data
+```
+
+### Write Flow (Top-Down)
+
+```swift
+1. Presentation Layer: User triggers action
+   └─> Button tap, form submission, etc.
+
+2. Domain Layer: Execute use case
+   └─> AsyncAction.run() coordinates operation
+
+3. Data Layer: Persist changes
+   └─> Repository.write() + Service.post()
+   └─> Database/API updated
+   └─> Observable emits new data (triggers read flow)
+```
+
+## Dependency Flow
+
+<CodeGroup>
+```swift DependencyContainer
+class DependencyContainer {
+    
+    // Data Layer
+    let database: DatabaseQueue
+    let preferences: Preferences
+    let secureStorage: SecureStorage
+    let houstonService: HoustonService
+    
+    // Repositories
+    let userRepository: UserRepository
+    let operationRepository: OperationRepository
+    let keysRepository: KeysRepository
+    
+    // Domain Layer
+    let fetchUserAction: AsyncAction<User>
+    let createOperationAction: AsyncAction<Operation>
+    
+    // Presentation Layer
+    func homeViewController() -> HomeViewController {
+        return HomeViewController(
+            presenter: homePresenter()
+        )
+    }
+}
+```
+
+```swift Injection
+// Dependencies injected from top to bottom
+let container = DependencyContainer()
+
+// Repository gets database
+let repo = OperationRepository(
+    queue: container.database
+)
+
+// Action gets repository
+let action = FetchOperationsAction(
+    repository: repo
+)
+
+// ViewController gets action
+let vc = OperationsViewController(
+    action: action
+)
+```
+</CodeGroup>
+
+## Benefits of This Architecture
+
+<AccordionGroup>
+  <Accordion title="Separation of Concerns">
+    Each layer has a single responsibility:
+    - **Presentation**: UI only
+    - **Domain**: Business logic only  
+    - **Data**: Data access only
+  </Accordion>
+
+  <Accordion title="Testability">
+    - Easy to mock dependencies
+    - Test each layer independently
+    - Domain logic testable without UI
+    - Repository pattern enables fake data sources
+  </Accordion>
+
+  <Accordion title="Maintainability">
+    - Changes localized to specific layers
+    - Clear dependencies between components
+    - Easy to understand data flow
+    - Consistent patterns throughout codebase
+  </Accordion>
+
+  <Accordion title="Scalability">
+    - Add new features without affecting existing code
+    - Swap implementations (e.g., database provider)
+    - Parallel development on different layers
+    - Reuse domain logic across platforms
+  </Accordion>
+</AccordionGroup>
+
+## Related Topics
+
+<CardGroup cols={3}>
+  <Card title="Repositories" icon="database" href="/ios/data/repositories">
+    Repository pattern implementation
+  </Card>
+  <Card title="Domain Models" icon="cube" href="/ios/domain/models">
+    Business entities and logic
+  </Card>
+  <Card title="View Controllers" icon="window" href="/ios/presentation/screens">
+    UI layer implementation
+  </Card>
+</CardGroup>

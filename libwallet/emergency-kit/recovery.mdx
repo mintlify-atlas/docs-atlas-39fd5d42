@@ -1,0 +1,582 @@
+---
+title: 'Emergency Kit Recovery'
+description: 'Recover wallet funds using the emergency kit'
+---
+
+## Overview
+
+The emergency kit recovery process allows users to recover their Bitcoin funds even if Muun servers are unavailable. This requires the recovery code and emergency kit PDF.
+
+## Recovery Prerequisites
+
+<ParamField path="Recovery Code" type="string" required>
+  16-character recovery code used to encrypt the emergency kit
+</ParamField>
+
+<ParamField path="Emergency Kit PDF" type="file" required>
+  PDF containing encrypted keys and output descriptors
+</ParamField>
+
+<ParamField path="Network" type="string" required>
+  Bitcoin network (mainnet or testnet)
+</ParamField>
+
+## Recovery Process
+
+### Step 1: Extract Encrypted Keys
+
+Parse the PDF to extract encrypted key data:
+
+```swift
+import PDFKit
+
+func extractKeysFromPDF(_ pdfData: Data) throws -> ExtractedKeys {
+    guard let pdfDocument = PDFDocument(data: pdfData) else {
+        throw RecoveryError.invalidPDF
+    }
+    
+    guard let page = pdfDocument.page(at: 0) else {
+        throw RecoveryError.emptyPDF
+    }
+    
+    guard let content = page.string else {
+        throw RecoveryError.noPDFContent
+    }
+    
+    // Extract encrypted keys using regex or text parsing
+    let pattern = #"[A-Za-z0-9+/=]{100,}"#
+    let regex = try NSRegularExpression(pattern: pattern)
+    let matches = regex.matches(
+        in: content,
+        range: NSRange(content.startIndex..., in: content)
+    )
+    
+    guard matches.count >= 2 else {
+        throw RecoveryError.keysNotFound
+    }
+    
+    let firstKey = String(content[Range(matches[0].range, in: content)!])
+    let secondKey = String(content[Range(matches[1].range, in: content)!])
+    
+    return ExtractedKeys(
+        firstEncryptedKey: firstKey,
+        secondEncryptedKey: secondKey
+    )
+}
+
+struct ExtractedKeys {
+    let firstEncryptedKey: String
+    let secondEncryptedKey: String
+}
+```
+
+### Step 2: Decrypt Keys
+
+Decrypt keys using the recovery code:
+
+<CodeGroup>
+
+```go Go
+func decryptKey(
+    encryptedKey string,
+    recoveryCode string,
+    salt string,
+) (*HDPrivateKey, error) {
+    // Convert recovery code to private key
+    challengeKey, err := RecoveryCodeToKey(recoveryCode, salt)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Decrypt with challenge key
+    decrypter := challengeKey.Decrypter()
+    decryptedBytes, err := decrypter.Decrypt(encryptedKey)
+    if err != nil {
+        return nil, fmt.Errorf("failed to decrypt key: %w", err)
+    }
+    
+    // Parse extended key
+    xprv := string(decryptedBytes)
+    hdKey, err := NewHDPrivateKeyFromString(xprv, network)
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse key: %w", err)
+    }
+    
+    return hdKey, nil
+}
+```
+
+```swift iOS
+func decryptKey(
+    _ encryptedKey: String,
+    with recoveryCode: String
+) throws -> LibwalletHDPrivateKey {
+    // Convert recovery code to challenge key
+    let challengeKey = try LibwalletRecoveryCodeToKey(
+        recoveryCode,
+        "muun"
+    )
+    
+    // Decrypt
+    let operation = LibwalletNewDecryptOperation(
+        challengeKey,
+        encryptedKey
+    )
+    
+    let decryptedData = try operation.decrypt()
+    let xprv = String(data: decryptedData, encoding: .utf8)!
+    
+    // Parse HD private key
+    let network = try LibwalletNewNetwork("mainnet")
+    let hdKey = try LibwalletNewHDPrivateKeyFromString(xprv, network)
+    
+    return hdKey
+}
+```
+
+</CodeGroup>
+
+### Step 3: Derive Address Keys
+
+Derive keys for different address types:
+
+```swift
+func deriveAddressKeys(
+    userBaseKey: LibwalletHDPrivateKey,
+    muunBaseKey: LibwalletHDPrivateKey,
+    addressIndex: Int,
+    isChange: Bool = false
+) throws -> (user: LibwalletHDPrivateKey, muun: LibwalletHDPrivateKey) {
+    let chain = isChange ? "change" : "external"
+    let path = "m/schema:1'/recovery:1'/\(chain):1/\(addressIndex)"
+    
+    let userKey = try userBaseKey.deriveTo(path)
+    let muunKey = try muunBaseKey.deriveTo(path)
+    
+    return (userKey, muunKey)
+}
+```
+
+### Step 4: Scan for UTXOs
+
+Scan the blockchain for unspent outputs:
+
+```swift
+class UTXOScanner {
+    let network: LibwalletNetwork
+    let blockchainAPI: BlockchainAPI
+    
+    func scanForUTXOs(
+        userKey: LibwalletHDPrivateKey,
+        muunKey: LibwalletHDPrivateKey,
+        gapLimit: Int = 20
+    ) async throws -> [UTXO] {
+        var utxos: [UTXO] = []
+        
+        // Scan external addresses (receiving)
+        let externalUTXOs = try await scanChain(
+            userKey: userKey,
+            muunKey: muunKey,
+            isChange: false,
+            gapLimit: gapLimit
+        )
+        utxos.append(contentsOf: externalUTXOs)
+        
+        // Scan internal addresses (change)
+        let changeUTXOs = try await scanChain(
+            userKey: userKey,
+            muunKey: muunKey,
+            isChange: true,
+            gapLimit: gapLimit
+        )
+        utxos.append(contentsOf: changeUTXOs)
+        
+        return utxos
+    }
+    
+    private func scanChain(
+        userKey: LibwalletHDPrivateKey,
+        muunKey: LibwalletHDPrivateKey,
+        isChange: Bool,
+        gapLimit: Int
+    ) async throws -> [UTXO] {
+        var utxos: [UTXO] = []
+        var consecutiveEmpty = 0
+        var index = 0
+        
+        while consecutiveEmpty < gapLimit {
+            // Derive keys for this index
+            let (userAddrKey, muunAddrKey) = try deriveAddressKeys(
+                userBaseKey: userKey,
+                muunBaseKey: muunKey,
+                addressIndex: index,
+                isChange: isChange
+            )
+            
+            // Generate address for each version
+            let addresses = try generateAllAddressVersions(
+                userKey: userAddrKey.publicKey(),
+                muunKey: muunAddrKey.publicKey()
+            )
+            
+            // Check each address for UTXOs
+            var foundUTXO = false
+            for address in addresses {
+                let addressUTXOs = try await blockchainAPI.getUTXOs(
+                    for: address.address
+                )
+                
+                if !addressUTXOs.isEmpty {
+                    foundUTXO = true
+                    consecutiveEmpty = 0
+                    utxos.append(contentsOf: addressUTXOs)
+                }
+            }
+            
+            if !foundUTXO {
+                consecutiveEmpty += 1
+            }
+            
+            index += 1
+        }
+        
+        return utxos
+    }
+    
+    private func generateAllAddressVersions(
+        userKey: LibwalletHDPublicKey,
+        muunKey: LibwalletHDPublicKey
+    ) throws -> [LibwalletMuunAddress] {
+        return [
+            try LibwalletCreateAddressV2(userKey, muunKey),
+            try LibwalletCreateAddressV3(userKey, muunKey),
+            try LibwalletCreateAddressV4(userKey, muunKey),
+            try LibwalletCreateAddressV5(userKey, muunKey),
+            try LibwalletCreateAddressV6(userKey, muunKey),
+        ]
+    }
+}
+```
+
+### Step 5: Create Recovery Transaction
+
+Build transaction to sweep all funds:
+
+```swift
+func createRecoveryTransaction(
+    utxos: [UTXO],
+    destinationAddress: String,
+    feeRate: Double
+) throws -> LibwalletPartiallySignedTransaction {
+    // Create inputs
+    let inputs = LibwalletInputList()
+    for utxo in utxos {
+        let input = RecoveryInput(utxo: utxo)
+        inputs.add(input)
+    }
+    
+    // Calculate total amount
+    let totalAmount = utxos.reduce(0) { $0 + $1.amount }
+    
+    // Estimate fee
+    let estimatedSize = estimateTransactionSize(inputCount: utxos.count)
+    let fee = Int64(Double(estimatedSize) * feeRate)
+    
+    // Create output
+    let outputAmount = totalAmount - fee
+    guard outputAmount > 546 else { // dust threshold
+        throw RecoveryError.insufficientFunds
+    }
+    
+    // Build raw transaction
+    let rawTx = try buildRawTransaction(
+        inputs: utxos,
+        outputAddress: destinationAddress,
+        outputAmount: outputAmount
+    )
+    
+    // Create PST
+    let nonces = LibwalletNewMusigNonces()
+    for _ in utxos {
+        let sessionId = Data.random(count: 32)
+        try nonces.add(sessionId)
+    }
+    
+    return try LibwalletNewPartiallySignedTransaction(
+        inputs,
+        rawTx,
+        nonces
+    )
+}
+```
+
+### Step 6: Sign and Broadcast
+
+Sign with both keys and broadcast:
+
+```swift
+func recoverFunds(
+    userKey: LibwalletHDPrivateKey,
+    muunKey: LibwalletHDPrivateKey,
+    utxos: [UTXO],
+    destinationAddress: String
+) async throws -> String {
+    // Create recovery transaction
+    let pst = try createRecoveryTransaction(
+        utxos: utxos,
+        destinationAddress: destinationAddress,
+        feeRate: 10.0
+    )
+    
+    // Sign with both keys (full signing for recovery)
+    let signedTx = try pst.fullySign(userKey, muunKey)
+    
+    // Broadcast
+    let txId = try await blockchainAPI.broadcast(signedTx.bytes)
+    
+    return txId
+}
+```
+
+## Output Descriptors
+
+### Parse Descriptors from PDF
+
+```swift
+func extractDescriptors(_ pdfData: Data) throws -> [String] {
+    guard let pdfDocument = PDFDocument(data: pdfData) else {
+        throw RecoveryError.invalidPDF
+    }
+    
+    guard let page = pdfDocument.page(at: 0),
+          let content = page.string else {
+        throw RecoveryError.noPDFContent
+    }
+    
+    // Extract descriptor patterns
+    let pattern = #"wsh\(sortedmulti\(2,.*?\)\)"#
+    let regex = try NSRegularExpression(pattern: pattern)
+    let matches = regex.matches(
+        in: content,
+        range: NSRange(content.startIndex..., in: content)
+    )
+    
+    return matches.compactMap { match in
+        guard let range = Range(match.range, in: content) else { return nil }
+        return String(content[range])
+    }
+}
+```
+
+### Use Descriptors with Bitcoin Core
+
+```bash
+# Import descriptor into Bitcoin Core
+bitcoin-cli importdescriptors '[
+  {
+    "desc": "wsh(sortedmulti(2,[a1b2c3d4/48h/0h/0h/2h]xpub.../0/*,[e5f6g7h8/48h/0h/0h/2h]xpub.../0/*))",
+    "timestamp": "now",
+    "range": [0, 1000],
+    "watchonly": true,
+    "label": "Muun Recovery - External",
+    "active": true
+  },
+  {
+    "desc": "wsh(sortedmulti(2,[a1b2c3d4/48h/0h/0h/2h]xpub.../1/*,[e5f6g7h8/48h/0h/0h/2h]xpub.../1/*))",
+    "timestamp": "now",
+    "range": [0, 1000],
+    "watchonly": true,
+    "label": "Muun Recovery - Change",
+    "active": true
+  }
+]'
+
+# Scan for transactions
+bitcoin-cli rescanblockchain
+
+# List unspent outputs
+bitcoin-cli listunspent 0 9999999 '[]' true '{"minimumAmount": 0.00000546}'
+```
+
+## Complete Recovery Manager
+
+```swift
+class EmergencyKitRecoveryManager {
+    let network: LibwalletNetwork
+    let scanner: UTXOScanner
+    
+    func recoverWallet(
+        pdfData: Data,
+        recoveryCode: String,
+        destinationAddress: String
+    ) async throws -> RecoveryResult {
+        // 1. Extract encrypted keys from PDF
+        let extractedKeys = try extractKeysFromPDF(pdfData)
+        
+        // 2. Decrypt keys
+        let userKey = try decryptKey(
+            extractedKeys.firstEncryptedKey,
+            with: recoveryCode
+        )
+        let muunKey = try decryptKey(
+            extractedKeys.secondEncryptedKey,
+            with: recoveryCode
+        )
+        
+        // 3. Scan for UTXOs
+        let utxos = try await scanner.scanForUTXOs(
+            userKey: userKey,
+            muunKey: muunKey
+        )
+        
+        guard !utxos.isEmpty else {
+            throw RecoveryError.noFundsFound
+        }
+        
+        let totalAmount = utxos.reduce(0) { $0 + $1.amount }
+        print("Found \(utxos.count) UTXOs totaling \(totalAmount) sats")
+        
+        // 4. Create and sign recovery transaction
+        let txId = try await recoverFunds(
+            userKey: userKey,
+            muunKey: muunKey,
+            utxos: utxos,
+            destinationAddress: destinationAddress
+        )
+        
+        return RecoveryResult(
+            transactionId: txId,
+            utxosRecovered: utxos.count,
+            amountRecovered: totalAmount
+        )
+    }
+}
+
+struct RecoveryResult {
+    let transactionId: String
+    let utxosRecovered: Int
+    let amountRecovered: Int64
+}
+```
+
+## Error Handling
+
+```swift
+enum RecoveryError: Error {
+    case invalidPDF
+    case emptyPDF
+    case noPDFContent
+    case keysNotFound
+    case decryptionFailed
+    case invalidRecoveryCode
+    case noFundsFound
+    case insufficientFunds
+    case broadcastFailed
+    
+    var localizedDescription: String {
+        switch self {
+        case .invalidPDF:
+            return "Could not read emergency kit PDF"
+        case .emptyPDF:
+            return "Emergency kit PDF is empty"
+        case .noPDFContent:
+            return "Could not extract content from PDF"
+        case .keysNotFound:
+            return "Could not find encrypted keys in PDF"
+        case .decryptionFailed:
+            return "Failed to decrypt keys. Check recovery code."
+        case .invalidRecoveryCode:
+            return "Recovery code is invalid"
+        case .noFundsFound:
+            return "No funds found in wallet"
+        case .insufficientFunds:
+            return "Balance too low (below dust threshold)"
+        case .broadcastFailed:
+            return "Failed to broadcast transaction"
+        }
+    }
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Validate Recovery Code Early">
+    Check recovery code format before attempting decryption:
+    ```swift
+    func validateRecoveryCode(_ code: String) throws {
+        try LibwalletValidateRecoveryCode(code)
+        
+        guard code.count == 19 else { // XXXX-XXXX-XXXX-XXXX
+            throw RecoveryError.invalidRecoveryCode
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Use Appropriate Gap Limit">
+    Use larger gap limit for thorough scanning:
+    ```swift
+    let gapLimit = 20  // Standard
+    let thoroughGapLimit = 100  // For long-unused wallets
+    
+    let utxos = try await scanner.scanForUTXOs(
+        userKey: userKey,
+        muunKey: muunKey,
+        gapLimit: thoroughGapLimit
+    )
+    ```
+  </Accordion>
+  
+  <Accordion title="Calculate Appropriate Fees">
+    Use current network fee rates:
+    ```swift
+    func getCurrentFeeRate() async throws -> Double {
+        let feeEstimate = try await blockchainAPI.estimateFee(blocks: 6)
+        return max(feeEstimate, 1.0) // At least 1 sat/vbyte
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Test Recovery Flow">
+    Test recovery on testnet first:
+    ```swift
+    #if DEBUG
+    let network = try LibwalletNewNetwork("testnet")
+    #else
+    let network = try LibwalletNewNetwork("mainnet")
+    #endif
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Security Warnings
+
+<Warning>
+  **Recovery Code Security**: The recovery code provides full access to wallet funds. Never share it or store it digitally.
+</Warning>
+
+<Warning>
+  **PDF Security**: Store the emergency kit PDF securely offline. Consider printing physical copies stored in multiple safe locations.
+</Warning>
+
+<Warning>
+  **Destination Address**: Verify the destination address carefully. Funds sent to wrong address cannot be recovered.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Emergency Kit Generation" icon="file-pdf" href="/libwallet/emergency-kit/generation">
+    Learn how to generate emergency kits
+  </Card>
+  <Card title="Transaction Signing" icon="signature" href="/libwallet/signing">
+    Understand transaction signing
+  </Card>
+  <Card title="Key Management" icon="key" href="/libwallet/crypto/keys">
+    HD key derivation and management
+  </Card>
+  <Card title="Address Generation" icon="location-dot" href="/libwallet/addresses">
+    Generate addresses for recovery
+  </Card>
+</CardGroup>

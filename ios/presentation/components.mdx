@@ -1,0 +1,654 @@
+---
+title: Components
+description: Reusable UI components in Muun iOS app
+---
+
+## Overview
+
+The Muun iOS app uses a component-based architecture for UI elements. Components are reusable views that extend `MUView` and can be composed to build screens.
+
+## MUView
+
+Base view class that all components extend:
+
+```swift
+class MUView: UIView {
+    
+    var toast: ToastView?
+    
+    required init?(coder aDecoder: NSCoder) {
+        super.init(coder: aDecoder)
+        initSubviews()
+    }
+    
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        initSubviews()
+    }
+    
+    func initSubviews() {
+        instantiateFromNib()
+        setUp()
+    }
+    
+    func setUp() {
+       // Override in subclass
+    }
+    
+    private func instantiateFromNib() {
+        let className = String(describing: type(of: self))
+            .components(separatedBy: ".")
+            .first!
+        
+        guard Bundle.main.path(forResource: className, ofType: "nib") != nil else {
+            return
+        }
+        
+        let nib = UINib(nibName: className, bundle: Bundle(for: type(of: self)))
+        
+        if let view = nib.instantiate(withOwner: self, options: nil).first as? UIView {
+            view.frame = bounds
+            addSubview(view)
+        }
+    }
+    
+    func addTo(_ view: UIView) {
+        self.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(self)
+        self.frame = view.bounds
+        
+        self.centerXAnchor.constraint(equalTo: view.centerXAnchor).isActive = true
+        self.centerYAnchor.constraint(equalTo: view.centerYAnchor).isActive = true
+        self.widthAnchor.constraint(equalTo: view.widthAnchor).isActive = true
+        self.heightAnchor.constraint(equalTo: view.heightAnchor).isActive = true
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/Presentation/Component/Base/MUView.swift:11`
+
+### Key Features
+
+- **NIB Support**: Automatically loads XIB file if available
+- **Toast Messages**: Built-in toast support
+- **Easy Addition**: `addTo()` method for constraint setup
+- **Lifecycle**: `setUp()` hook for initialization
+
+## Component Categories
+
+<Tabs>
+  <Tab title="Input Components">
+    - `AmountInputView`: Bitcoin amount input
+    - `TextInputView`: Text field wrapper
+    - `PinInputView`: PIN code entry
+  </Tab>
+  <Tab title="Display Components">
+    - `BalanceView`: Wallet balance display
+    - `AmountLabel`: Formatted amount display
+    - `BlockClockView`: Block height display
+    - `OperationCell`: Operation list item
+  </Tab>
+  <Tab title="Button Components">
+    - `ButtonView`: Primary button
+    - `LightButtonView`: Secondary button
+    - `LinkButtonView`: Text link button
+    - `SmallButtonView`: Compact button
+  </Tab>
+  <Tab title="Utility Components">
+    - `LoadingView`: Full-screen loading overlay
+    - `ToastView`: Temporary message
+    - `ErrorView`: Error state display
+    - `CheckView`: Checkmark indicator
+  </Tab>
+</Tabs>
+
+## Common Components
+
+### ButtonView
+
+Primary button component:
+
+```swift
+class ButtonView: MUView {
+    
+    @IBOutlet weak var button: UIButton!
+    @IBOutlet weak var activityIndicator: UIActivityIndicatorView!
+    
+    var isEnabled: Bool = true {
+        didSet {
+            button.isEnabled = isEnabled
+            button.alpha = isEnabled ? 1.0 : 0.5
+        }
+    }
+    
+    var isLoading: Bool = false {
+        didSet {
+            if isLoading {
+                button.setTitle("", for: .normal)
+                activityIndicator.startAnimating()
+            } else {
+                activityIndicator.stopAnimating()
+            }
+        }
+    }
+    
+    override func setUp() {
+        button.layer.cornerRadius = 8
+        button.backgroundColor = Asset.Colors.muunBlue.color
+        button.setTitleColor(.white, for: .normal)
+        button.titleLabel?.font = Constant.Fonts.system(size: 16, weight: .medium)
+    }
+    
+    func setTitle(_ title: String) {
+        button.setTitle(title, for: .normal)
+    }
+    
+    func setAction(target: Any?, action: Selector) {
+        button.addTarget(target, action: action, for: .touchUpInside)
+    }
+}
+```
+
+**Usage:**
+```swift
+let sendButton = ButtonView()
+sendButton.setTitle("Send")
+sendButton.setAction(target: self, action: #selector(onSendTapped))
+view.addSubview(sendButton)
+
+// During operation
+sendButton.isLoading = true
+
+// After completion
+sendButton.isLoading = false
+```
+
+### AmountInputView
+
+Bitcoin amount input with currency conversion:
+
+```swift
+class AmountInputView: MUView {
+    
+    @IBOutlet weak var amountTextField: UITextField!
+    @IBOutlet weak var currencyLabel: UILabel!
+    @IBOutlet weak var convertedAmountLabel: UILabel!
+    
+    var satoshis: Satoshis? {
+        guard let text = amountTextField.text,
+              let amount = Decimal(string: text) else {
+            return nil
+        }
+        return Satoshis(value: Int(amount * 100_000_000))
+    }
+    
+    var currency: String = "BTC" {
+        didSet {
+            currencyLabel.text = currency
+            updateConversion()
+        }
+    }
+    
+    var exchangeRate: Decimal = 0 {
+        didSet {
+            updateConversion()
+        }
+    }
+    
+    override func setUp() {
+        amountTextField.delegate = self
+        amountTextField.keyboardType = .decimalPad
+        amountTextField.placeholder = "0.00"
+        amountTextField.addTarget(self, action: #selector(textDidChange), for: .editingChanged)
+    }
+    
+    @objc private func textDidChange() {
+        updateConversion()
+    }
+    
+    private func updateConversion() {
+        guard let satoshis = satoshis, exchangeRate > 0 else {
+            convertedAmountLabel.text = ""
+            return
+        }
+        
+        let btc = Decimal(satoshis.value) / 100_000_000
+        let fiat = btc * exchangeRate
+        convertedAmountLabel.text = "≈ $\(fiat.formatted())"
+    }
+    
+    func clear() {
+        amountTextField.text = ""
+        convertedAmountLabel.text = ""
+    }
+}
+
+extension AmountInputView: UITextFieldDelegate {
+    
+    func textField(_ textField: UITextField,
+                   shouldChangeCharactersIn range: NSRange,
+                   replacementString string: String) -> Bool {
+        // Validate decimal input
+        let allowedCharacters = CharacterSet(charactersIn: "0123456789.")
+        let characterSet = CharacterSet(charactersIn: string)
+        return allowedCharacters.isSuperset(of: characterSet)
+    }
+}
+```
+
+**Usage:**
+```swift
+let amountInput = AmountInputView()
+amountInput.currency = "BTC"
+amountInput.exchangeRate = 45000
+view.addSubview(amountInput)
+
+// Get amount
+if let satoshis = amountInput.satoshis {
+    print("Amount: \(satoshis.value) sats")
+}
+```
+
+### BalanceView
+
+Display wallet balance with hide/show toggle:
+
+```swift
+class BalanceView: MUView {
+    
+    @IBOutlet weak var balanceLabel: UILabel!
+    @IBOutlet weak var fiatBalanceLabel: UILabel!
+    @IBOutlet weak var toggleButton: UIButton!
+    
+    private var isHidden: Bool = false {
+        didSet {
+            updateVisibility()
+        }
+    }
+    
+    private var balance: Satoshis = Satoshis(value: 0)
+    private var exchangeRate: Decimal = 0
+    
+    override func setUp() {
+        toggleButton.addTarget(self, action: #selector(onToggleTapped), for: .touchUpInside)
+        updateVisibility()
+    }
+    
+    func set(balance: Satoshis, exchangeRate: Decimal = 0) {
+        self.balance = balance
+        self.exchangeRate = exchangeRate
+        updateBalanceLabels()
+    }
+    
+    private func updateBalanceLabels() {
+        if isHidden {
+            balanceLabel.text = "••••••"
+            fiatBalanceLabel.text = "••••••"
+        } else {
+            let btc = Decimal(balance.value) / 100_000_000
+            balanceLabel.text = "\(btc.formatted()) BTC"
+            
+            if exchangeRate > 0 {
+                let fiat = btc * exchangeRate
+                fiatBalanceLabel.text = "$\(fiat.formatted())"
+            }
+        }
+    }
+    
+    private func updateVisibility() {
+        let icon = isHidden ? "eye.slash" : "eye"
+        toggleButton.setImage(UIImage(systemName: icon), for: .normal)
+        updateBalanceLabels()
+    }
+    
+    @objc private func onToggleTapped() {
+        isHidden.toggle()
+    }
+}
+```
+
+**Usage:**
+```swift
+let balanceView = BalanceView()
+balanceView.set(
+    balance: Satoshis(value: 50_000_000),
+    exchangeRate: 45000
+)
+view.addSubview(balanceView)
+```
+
+### LoadingView
+
+Full-screen loading overlay:
+
+```swift
+class LoadingView: MUView {
+    
+    @IBOutlet weak var activityIndicator: UIActivityIndicatorView!
+    @IBOutlet weak var titleLabel: UILabel!
+    @IBOutlet weak var overlayView: UIView!
+    
+    var titleText: String = "Loading..." {
+        didSet {
+            titleLabel.text = titleText
+        }
+    }
+    
+    override func setUp() {
+        overlayView.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        activityIndicator.style = .large
+        activityIndicator.color = .white
+        activityIndicator.startAnimating()
+        
+        titleLabel.textColor = .white
+        titleLabel.font = Constant.Fonts.system(size: 16, weight: .medium)
+    }
+}
+```
+
+### ToastView
+
+Temporary message display:
+
+```swift
+class ToastView: MUView {
+    
+    @IBOutlet weak var messageLabel: UILabel!
+    @IBOutlet weak var containerView: UIView!
+    
+    override func setUp() {
+        containerView.backgroundColor = Asset.Colors.muunGrayDark.color
+        containerView.layer.cornerRadius = 8
+        
+        messageLabel.textColor = .white
+        messageLabel.font = Constant.Fonts.system(size: 14, weight: .regular)
+        messageLabel.numberOfLines = 0
+    }
+    
+    func show(message: String, duration: TimeInterval = 3.0) {
+        messageLabel.text = message
+        alpha = 0
+        
+        UIView.animate(withDuration: 0.3) {
+            self.alpha = 1
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+            self.animateOut()
+        }
+    }
+    
+    func animateOut() {
+        UIView.animate(withDuration: 0.3, animations: {
+            self.alpha = 0
+        }, completion: { _ in
+            self.removeFromSuperview()
+        })
+    }
+}
+```
+
+## Component Composition
+
+Components can be composed to build complex views:
+
+```swift
+class SendFormView: MUView {
+    
+    private var amountInput: AmountInputView!
+    private var addressInput: TextInputView!
+    private var feeSelector: FeeSelectorView!
+    private var confirmButton: ButtonView!
+    
+    override func setUp() {
+        // Create subcomponents
+        amountInput = AmountInputView()
+        addressInput = TextInputView()
+        feeSelector = FeeSelectorView()
+        confirmButton = ButtonView()
+        
+        // Add to view hierarchy
+        addSubview(amountInput)
+        addSubview(addressInput)
+        addSubview(feeSelector)
+        addSubview(confirmButton)
+        
+        // Layout constraints
+        setupConstraints()
+        
+        // Configure
+        addressInput.placeholder = "Bitcoin address"
+        confirmButton.setTitle("Send")
+        confirmButton.setAction(target: self, action: #selector(onConfirmTapped))
+    }
+    
+    @objc private func onConfirmTapped() {
+        guard let amount = amountInput.satoshis,
+              let address = addressInput.text,
+              let fee = feeSelector.selectedFee else {
+            return
+        }
+        
+        // Notify delegate
+        delegate?.sendFormDidConfirm(
+            amount: amount,
+            address: address,
+            fee: fee
+        )
+    }
+}
+```
+
+## Cell Components
+
+Table view and collection view cells:
+
+```swift
+class OperationCell: UITableViewCell {
+    
+    @IBOutlet weak var amountLabel: UILabel!
+    @IBOutlet weak var statusLabel: UILabel!
+    @IBOutlet weak var dateLabel: UILabel!
+    @IBOutlet weak var iconImageView: UIImageView!
+    
+    func configure(with operation: Operation) {
+        // Amount
+        let btc = Decimal(operation.amount.inSatoshis.value) / 100_000_000
+        let sign = operation.direction == .INCOMING ? "+" : "-"
+        amountLabel.text = "\(sign)\(btc.formatted()) BTC"
+        amountLabel.textColor = operation.direction == .INCOMING 
+            ? Asset.Colors.muunGreen.color 
+            : Asset.Colors.muunGrayDark.color
+        
+        // Status
+        statusLabel.text = operation.status.rawValue
+        statusLabel.textColor = statusColor(for: operation.status)
+        
+        // Date
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        dateLabel.text = formatter.string(from: operation.creationDate)
+        
+        // Icon
+        iconImageView.image = icon(for: operation.direction)
+    }
+    
+    private func statusColor(for status: OperationStatus) -> UIColor {
+        switch status {
+        case .SETTLED, .CONFIRMED:
+            return Asset.Colors.muunGreen.color
+        case .FAILED, .DROPPED:
+            return Asset.Colors.muunRed.color
+        default:
+            return Asset.Colors.muunGrayDark.color
+        }
+    }
+    
+    private func icon(for direction: OperationDirection) -> UIImage? {
+        switch direction {
+        case .INCOMING:
+            return UIImage(systemName: "arrow.down.circle")
+        case .OUTGOING:
+            return UIImage(systemName: "arrow.up.circle")
+        case .CYCLICAL:
+            return UIImage(systemName: "arrow.triangle.2.circlepath")
+        }
+    }
+}
+```
+
+**Usage:**
+```swift
+func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    let cell = tableView.dequeueReusableCell(withIdentifier: "OperationCell", for: indexPath) as! OperationCell
+    cell.configure(with: operations[indexPath.row])
+    return cell
+}
+```
+
+## Component Guidelines
+
+<AccordionGroup>
+  <Accordion title="Single Responsibility">
+    Each component should do one thing well. Don't create monolithic components.
+  </Accordion>
+
+  <Accordion title="Reusability">
+    Design components to be reusable across multiple screens. Avoid screen-specific logic.
+  </Accordion>
+
+  <Accordion title="Configuration">
+    Expose properties for configuration. Use public properties instead of init parameters.
+  </Accordion>
+
+  <Accordion title="Delegation">
+    Use delegates or closures for event handling. Don't directly access parent views.
+  </Accordion>
+
+  <Accordion title="Self-Contained">
+    Components should be self-contained. Don't require external setup after initialization.
+  </Accordion>
+</AccordionGroup>
+
+## Styling
+
+Components use centralized styling:
+
+```swift
+enum Asset {
+    enum Colors {
+        static let muunBlue = UIColor(named: "muunBlue")!
+        static let muunGrayDark = UIColor(named: "muunGrayDark")!
+        static let muunGreen = UIColor(named: "muunGreen")!
+        static let muunRed = UIColor(named: "muunRed")!
+        static let background = UIColor(named: "background")!
+        static let title = UIColor(named: "title")!
+    }
+}
+
+enum Constant {
+    enum Fonts {
+        static func system(size: CGFloat, weight: UIFont.Weight) -> UIFont {
+            return UIFont.systemFont(ofSize: size, weight: weight)
+        }
+    }
+    
+    enum Dimens {
+        static let viewControllerPadding: CGFloat = 16
+        static let buttonHeight: CGFloat = 48
+        static let cornerRadius: CGFloat = 8
+    }
+}
+```
+
+## XIB vs Code
+
+Components can be created with XIB or programmatically:
+
+<Tabs>
+  <Tab title="XIB">
+    ```swift
+// ButtonView.swift with ButtonView.xib
+class ButtonView: MUView {
+    @IBOutlet weak var button: UIButton!
+    
+    // XIB automatically loaded by MUView
+}
+    ```
+    **Pros**: Visual design, faster prototyping
+    **Cons**: Harder to review in Git, less flexible
+  </Tab>
+  <Tab title="Code">
+    ```swift
+class ButtonView: MUView {
+    
+    let button = UIButton()
+    
+    override func setUp() {
+        addSubview(button)
+        
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.topAnchor.constraint(equalTo: topAnchor),
+            button.leadingAnchor.constraint(equalTo: leadingAnchor),
+            button.trailingAnchor.constraint(equalTo: trailingAnchor),
+            button.bottomAnchor.constraint(equalTo: bottomAnchor),
+            button.heightAnchor.constraint(equalToConstant: 48)
+        ])
+        
+        button.layer.cornerRadius = 8
+        button.backgroundColor = Asset.Colors.muunBlue.color
+    }
+}
+    ```
+    **Pros**: Git-friendly, more control, easier testing
+    **Cons**: More verbose, slower initial development
+  </Tab>
+</Tabs>
+
+## Testing Components
+
+```swift
+class ButtonViewTests: XCTestCase {
+    
+    var button: ButtonView!
+    
+    override func setUp() {
+        button = ButtonView()
+    }
+    
+    func testEnabledState() {
+        button.isEnabled = true
+        XCTAssertTrue(button.button.isEnabled)
+        XCTAssertEqual(button.button.alpha, 1.0)
+        
+        button.isEnabled = false
+        XCTAssertFalse(button.button.isEnabled)
+        XCTAssertEqual(button.button.alpha, 0.5)
+    }
+    
+    func testLoadingState() {
+        button.setTitle("Send")
+        XCTAssertEqual(button.button.title(for: .normal), "Send")
+        
+        button.isLoading = true
+        XCTAssertEqual(button.button.title(for: .normal), "")
+        
+        button.isLoading = false
+        XCTAssertEqual(button.button.title(for: .normal), "Send")
+    }
+}
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Screens" icon="window" href="/ios/presentation/screens">
+    View controllers that use components
+  </Card>
+  <Card title="Architecture" icon="layer-group" href="/ios/architecture-layers">
+    Presentation layer architecture
+  </Card>
+</CardGroup>

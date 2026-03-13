@@ -1,0 +1,576 @@
+---
+title: 'Transaction Creation & Validation'
+description: 'Build and validate Bitcoin transactions in Muun Wallet'
+---
+
+## Overview
+
+Muun's transaction system uses Partially Signed Transactions (PST) to coordinate signing between user and server. This ensures both parties validate the transaction before signing.
+
+## PartiallySignedTransaction
+
+### Structure
+
+```go
+type PartiallySignedTransaction struct {
+    tx     *wire.MsgTx  // Bitcoin transaction
+    inputs []Input       // Input metadata
+    nonces *MusigNonces  // For MuSig2 signing
+}
+```
+
+### Creation
+
+<CodeGroup>
+
+```go Go
+func NewPartiallySignedTransaction(
+    inputs *InputList,
+    rawTx []byte,
+    userNonces *MusigNonces,
+) (*PartiallySignedTransaction, error) {
+    tx := wire.NewMsgTx(0)
+    err := tx.Deserialize(bytes.NewReader(rawTx))
+    if err != nil {
+        return nil, fmt.Errorf("failed to decode tx: %w", err)
+    }
+    
+    return &PartiallySignedTransaction{
+        tx:     tx,
+        inputs: inputs.Inputs(),
+        nonces: userNonces,
+    }, nil
+}
+```
+
+```swift iOS
+let inputs = LibwalletInputList()
+// Add inputs to list...
+
+let nonces = LibwalletNewMusigNonces()
+for _ in 0..<inputCount {
+    let sessionId = Data.random(count: 32)
+    try! nonces.add(sessionId)
+}
+
+let pst = try! LibwalletNewPartiallySignedTransaction(
+    inputs,
+    rawTxBytes,
+    nonces
+)
+```
+
+</CodeGroup>
+
+## Input Types
+
+### Input Interface
+
+```go
+type Input interface {
+    OutPoint() Outpoint
+    Address() MuunAddress
+    UserSignature() []byte
+    MuunSignature() []byte
+    SubmarineSwapV1() InputSubmarineSwapV1
+    SubmarineSwapV2() InputSubmarineSwapV2
+    IncomingSwap() InputIncomingSwap
+    MuunPublicNonce() []byte
+}
+```
+
+### Outpoint
+
+```go
+type Outpoint interface {
+    TxId() []byte
+    Index() int
+    Amount() int64
+}
+```
+
+### Example Input Creation
+
+```swift
+class TransactionInput: LibwalletInputProtocol {
+    let txId: Data
+    let index: Int
+    let amount: Int64
+    let address: LibwalletMuunAddress
+    
+    func outPoint() -> LibwalletOutpoint {
+        return TransactionOutpoint(
+            txId: txId,
+            index: index,
+            amount: amount
+        )
+    }
+    
+    func address() -> LibwalletMuunAddress {
+        return address
+    }
+    
+    // Implement other methods...
+}
+```
+
+## Transaction Signing
+
+### Sign with User Key
+
+Sign transaction inputs with user's private key:
+
+```go
+func (p *PartiallySignedTransaction) Sign(
+    userKey *HDPrivateKey,
+    muunKey *HDPublicKey,
+) (*Transaction, error) {
+    coins, err := p.coins(userKey.Network)
+    if err != nil {
+        return nil, fmt.Errorf("could not convert input data to coin: %w", err)
+    }
+    
+    for i, coin := range coins {
+        err = coin.SignInput(i, p.tx, userKey, muunKey)
+        if err != nil {
+            return nil, fmt.Errorf("failed to sign input: %w", err)
+        }
+    }
+    
+    return newTransaction(p.tx)
+}
+```
+
+### Full Signing (Recovery)
+
+Sign with both keys for recovery:
+
+```go
+func (p *PartiallySignedTransaction) FullySign(
+    userKey, muunKey *HDPrivateKey,
+) (*Transaction, error) {
+    coins, err := p.coins(userKey.Network)
+    if err != nil {
+        return nil, fmt.Errorf("could not convert input data to coin: %w", err)
+    }
+    
+    for i, coin := range coins {
+        err = coin.FullySignInput(i, p.tx, userKey, muunKey)
+        if err != nil {
+            return nil, fmt.Errorf("failed to sign input: %w", err)
+        }
+    }
+    
+    return newTransaction(p.tx)
+}
+```
+
+## Transaction Validation
+
+### SigningExpectations
+
+Define what you expect in the transaction:
+
+```go
+type SigningExpectations struct {
+    destination string      // Recipient address
+    amount      int64       // Amount to send
+    change      MuunAddress // Change address
+    fee         int64       // Expected fee
+    alternative bool        // Alternative TX flag
+}
+```
+
+### Verification
+
+Validate transaction before signing:
+
+<Tabs>
+  <Tab title="Go">
+    ```go
+    expectations := &SigningExpectations{
+        destination: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        amount:      100000, // 0.001 BTC
+        change:      changeAddress,
+        fee:         1000,
+        alternative: false,
+    }
+    
+    err := pst.Verify(expectations, userPubKey, muunPubKey)
+    if err != nil {
+        return fmt.Errorf("transaction verification failed: %w", err)
+    }
+    ```
+  </Tab>
+  
+  <Tab title="Swift">
+    ```swift
+    let expectations = SigningExpectations(
+        destination: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        amount: 100000,
+        change: changeAddress,
+        fee: 1000,
+        alternative: false
+    )
+    
+    do {
+        try pst.verify(
+            expectations,
+            userPublicKey: userPubKey,
+            muunPublickKey: muunPubKey
+        )
+        // Transaction is valid, safe to sign
+    } catch {
+        print("Verification failed: \(error)")
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Validation Checks
+
+The verification performs these checks:
+
+<AccordionGroup>
+  <Accordion title="Output Count Validation">
+    ```go
+    if expectations.change != nil {
+        if expectations.alternative {
+            if len(p.tx.TxOut) > 2 {
+                return fmt.Errorf("expected at most destination and change outputs but found %v", len(p.tx.TxOut))
+            }
+        } else if len(p.tx.TxOut) != 2 {
+            return fmt.Errorf("expected destination and change outputs but found %v", len(p.tx.TxOut))
+        }
+    } else if len(p.tx.TxOut) != 1 {
+        return fmt.Errorf("expected destination output only but found %v", len(p.tx.TxOut))
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Destination Validation">
+    ```go
+    toScript, err := addressToScript(expectations.destination, network)
+    if err != nil {
+        return err
+    }
+    
+    var toOutput *wire.TxOut
+    for _, output := range p.tx.TxOut {
+        if bytes.Equal(output.PkScript, toScript) {
+            toOutput = output
+            break
+        }
+    }
+    
+    if toOutput == nil {
+        return errors.New("destination output is not present")
+    }
+    
+    if toOutput.Value != expectedAmount {
+        return fmt.Errorf("destination amount is mismatched. found %v expected %v",
+            toOutput.Value, expectedAmount)
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Change Validation">
+    ```go
+    if expectedChange != nil {
+        expectedChangeAmount := actualTotal - expectedAmount - expectedFee
+        if changeOutput.Value != expectedChangeAmount {
+            return fmt.Errorf("change amount is mismatched. found %v expected %v",
+                changeOutput.Value, expectedChangeAmount)
+        }
+        
+        // Verify change address is derived correctly
+        derivedUserKey, err := userPublicKey.DeriveTo(expectedChange.DerivationPath())
+        derivedMuunKey, err := muunPublickKey.DeriveTo(expectedChange.DerivationPath())
+        
+        expectedChangeAddress, err := addresses.Create(
+            expectedChange.Version(),
+            &derivedUserKey.key,
+            &derivedMuunKey.key,
+            expectedChange.DerivationPath(),
+            network.network,
+        )
+        
+        if expectedChangeAddress.Address() != expectedChange.Address() {
+            return fmt.Errorf("mismatched change address")
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Fee Validation">
+    ```go
+    var actualTotal int64
+    for _, input := range p.inputs {
+        actualTotal += input.OutPoint().Amount()
+    }
+    
+    actualFee := actualTotal - expectedAmount - changeAmount
+    if actualFee != expectedFee {
+        return fmt.Errorf("fee mismatched. found %v, expected %v",
+            actualFee, expectedFee)
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Coin Types
+
+Different address versions require different signing logic:
+
+### Coin Interface
+
+```go
+type coin interface {
+    SignInput(index int, tx *wire.MsgTx,
+        userKey *HDPrivateKey, muunKey *HDPublicKey) error
+    FullySignInput(index int, tx *wire.MsgTx,
+        userKey, muunKey *HDPrivateKey) error
+}
+```
+
+### Creating Coins
+
+```go
+func createCoin(
+    index int,
+    input Input,
+    network *Network,
+    sigHashes *txscriptw.TaprootSigHashes,
+    userNonces *MusigNonces,
+) (coin, error) {
+    version := input.Address().Version()
+    
+    switch version {
+    case addresses.V1:
+        return &coinV1{...}, nil
+    case addresses.V2:
+        return &coinV2{...}, nil
+    case addresses.V3:
+        return &coinV3{...}, nil
+    case addresses.V4:
+        return &coinV4{...}, nil
+    case addresses.V5:
+        return &coinV5{...}, nil
+    case addresses.V6:
+        return &coinV6{...}, nil
+    case addresses.SubmarineSwapV1:
+        return &coinSubmarineSwapV1{...}, nil
+    case addresses.SubmarineSwapV2:
+        return &coinSubmarineSwapV2{...}, nil
+    default:
+        return nil, fmt.Errorf("unsupported version %v", version)
+    }
+}
+```
+
+### V5 Coin Example
+
+```go
+type coinV5 struct {
+    Network        *chaincfg.Params
+    OutPoint       wire.OutPoint
+    KeyPath        string
+    Amount         btcutil.Amount
+    UserSessionId  [32]byte
+    MuunPubNonce   [66]byte
+    MuunPartialSig [32]byte
+    SigHashes      *txscriptw.TaprootSigHashes
+}
+
+func (c *coinV5) SignInput(
+    index int,
+    tx *wire.MsgTx,
+    userKey *HDPrivateKey,
+    muunKey *HDPublicKey,
+) error {
+    // Derive keys to path
+    derivedUserKey, err := userKey.DeriveTo(c.KeyPath)
+    derivedMuunKey, err := muunKey.DeriveTo(c.KeyPath)
+    
+    // Calculate sighash
+    sigHash, err := txscriptw.CalcTaprootSigHash(
+        tx, c.SigHashes, index, txscript.SigHashAll,
+    )
+    
+    // Sign with MuSig2
+    return c.signSecondWith(
+        index, tx,
+        userEcPriv, muunEcPub,
+        c.UserSessionId, sigHash,
+    )
+}
+```
+
+## Transaction Result
+
+### Transaction Type
+
+```go
+type Transaction struct {
+    Hash  string
+    Bytes []byte
+}
+```
+
+### Serialization
+
+```go
+func newTransaction(tx *wire.MsgTx) (*Transaction, error) {
+    var buf bytes.Buffer
+    err := tx.Serialize(&buf)
+    if err != nil {
+        return nil, fmt.Errorf("failed to encode tx: %w", err)
+    }
+    
+    return &Transaction{
+        Hash:  tx.TxHash().String(),
+        Bytes: buf.Bytes(),
+    }, nil
+}
+```
+
+## Input List Management
+
+### InputList
+
+```go
+type InputList struct {
+    inputs []Input
+}
+
+func (l *InputList) Add(input Input) {
+    l.inputs = append(l.inputs, input)
+}
+
+func (l *InputList) Inputs() []Input {
+    return l.inputs
+}
+```
+
+### iOS Usage
+
+```swift
+let inputs = LibwalletInputList()
+
+for utxo in utxos {
+    let input = TransactionInput(
+        outpoint: utxo.outpoint,
+        address: utxo.address,
+        amount: utxo.amount
+    )
+    inputs.add(input)
+}
+
+let pst = try! LibwalletNewPartiallySignedTransaction(
+    inputs,
+    rawTx,
+    nonces
+)
+```
+
+## Dust Threshold
+
+Muun enforces a dust threshold to prevent uneconomical outputs:
+
+```go
+const dustThreshold = 546 // satoshis
+```
+
+Outputs smaller than this are considered "dust" and may be rejected.
+
+## Alternative Transactions
+
+Alternative transactions allow flexible fee adjustment:
+
+```go
+func (e *SigningExpectations) ForAlternativeTransaction() *SigningExpectations {
+    return &SigningExpectations{
+        e.destination,
+        e.amount,
+        e.change,
+        e.fee,
+        true, // alternative flag
+    }
+}
+```
+
+Alternative TXs:
+- May omit destination output if amount too small
+- Move reduced amount to fee
+- Help with fee bumping
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Always Verify Before Signing">
+    Never sign a transaction without verifying it matches expectations:
+    ```swift
+    do {
+        try pst.verify(expectations, userPubKey, muunPubKey)
+        let signedTx = try pst.sign(userPrivKey, muunPubKey)
+        broadcast(signedTx)
+    } catch {
+        // Handle verification failure
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Generate Fresh Nonces">
+    Always use cryptographically random nonces for MuSig2:
+    ```swift
+    import CryptoKit
+    
+    let sessionId = Data(SymmetricKey(size: .bits256))
+    try nonces.add(sessionId)
+    ```
+  </Accordion>
+  
+  <Accordion title="Check Network Match">
+    Ensure all addresses match the network:
+    ```swift
+    guard address.network == .mainnet else {
+        throw TransactionError.networkMismatch
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Validate Change Derivation">
+    Always verify change addresses are properly derived:
+    ```go
+    if changeOutput != nil {
+        expectedAddress, err := addresses.Create(
+            changeVersion,
+            userKey,
+            muunKey,
+            changePath,
+            network,
+        )
+        if expectedAddress.Address() != changeAddress {
+            return errors.New("invalid change address")
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Transaction Signing" icon="signature" href="/libwallet/signing">
+    Learn MuSig2 signing for Taproot
+  </Card>
+  <Card title="Fee Estimation" icon="calculator" href="/libwallet/fee-estimation">
+    Calculate optimal transaction fees
+  </Card>
+  <Card title="Submarine Swaps" icon="arrows-rotate" href="/libwallet/lightning/swaps">
+    Handle Lightning submarine swaps
+  </Card>
+  <Card title="Emergency Recovery" icon="life-ring" href="/libwallet/emergency-kit/recovery">
+    Recover funds using emergency kit
+  </Card>
+</CardGroup>

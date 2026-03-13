@@ -1,0 +1,707 @@
+---
+title: 'Submarine Swaps'
+description: 'Lightning to on-chain submarine swap implementation'
+---
+
+## Overview
+
+Submarine swaps allow converting Lightning payments to on-chain Bitcoin outputs. Muun supports two submarine swap versions for sending and receiving Lightning payments.
+
+## SubmarineSwap Structure
+
+```go
+type SubmarineSwap struct {
+    Invoice       string
+    Receiver      SubmarineSwapReceiver
+    FundingOutput SubmarineSwapFundingOutput
+    PreimageInHex string
+}
+
+type SubmarineSwapReceiver struct {
+    Alias     string
+    PublicKey string
+}
+
+type SubmarineSwapFundingOutput struct {
+    ScriptVersion          int64
+    OutputAddress          string
+    OutputAmount           int64
+    ConfirmationsNeeded    int
+    ServerPaymentHashInHex string
+    ServerPublicKeyInHex   string
+    
+    UserLockTime int64 // V1 only
+    
+    // V2 fields
+    ExpirationInBlocks int64
+    UserPublicKey      *hdkeychain.ExtendedKey
+    MuunPublicKey      *hdkeychain.ExtendedKey
+    KeyPath            string
+}
+```
+
+## Submarine Swap V1
+
+### V1 Witness Script
+
+V1 swaps use time-locked refund scripts:
+
+```go
+func createWitnessScriptV1(
+    userRefundAddress string,
+    swapServerPublicKey []byte,
+    paymentHash256 []byte,
+    numBlocksForExpiration int64,
+    network *chaincfg.Params,
+) ([]byte, error) {
+    // Script: 
+    // OP_DUP OP_HASH160 <swap_server_pubkey_hash> OP_EQUAL
+    // OP_IF
+    //     OP_HASH160 <payment_hash> OP_EQUALVERIFY
+    // OP_ELSE
+    //     <num_blocks> OP_CHECKSEQUENCEVERIFY OP_DROP
+    //     OP_DUP OP_HASH160 <user_refund_address_hash> OP_EQUALVERIFY
+    // OP_ENDIF
+    // OP_CHECKSIG
+    
+    builder := txscript.NewScriptBuilder()
+    
+    // If branch (swap server with preimage)
+    builder.AddOp(txscript.OP_DUP)
+    builder.AddOp(txscript.OP_HASH160)
+    builder.AddData(btcutil.Hash160(swapServerPublicKey))
+    builder.AddOp(txscript.OP_EQUAL)
+    builder.AddOp(txscript.OP_IF)
+    builder.AddOp(txscript.OP_HASH160)
+    builder.AddData(paymentHash256)
+    builder.AddOp(txscript.OP_EQUALVERIFY)
+    
+    // Else branch (user refund after timeout)
+    builder.AddOp(txscript.OP_ELSE)
+    builder.AddInt64(numBlocksForExpiration)
+    builder.AddOp(txscript.OP_CHECKSEQUENCEVERIFY)
+    builder.AddOp(txscript.OP_DROP)
+    builder.AddOp(txscript.OP_DUP)
+    builder.AddOp(txscript.OP_HASH160)
+    
+    refundAddr, err := btcutilw.DecodeAddress(userRefundAddress, network)
+    if err != nil {
+        return nil, err
+    }
+    builder.AddData(refundAddr.ScriptAddress())
+    builder.AddOp(txscript.OP_EQUALVERIFY)
+    builder.AddOp(txscript.OP_ENDIF)
+    builder.AddOp(txscript.OP_CHECKSIG)
+    
+    return builder.Script()
+}
+```
+
+### V1 Address Creation
+
+```go
+const (
+    SubmarineSwapV1 = 101
+)
+
+func createSwapAddressV1(
+    witnessScript []byte,
+    network *chaincfg.Params,
+) (string, error) {
+    redeemScript, err := createNonNativeSegwitRedeemScript(witnessScript)
+    if err != nil {
+        return "", err
+    }
+    
+    address, err := btcutil.NewAddressScriptHash(redeemScript, network)
+    if err != nil {
+        return "", err
+    }
+    
+    return address.EncodeAddress(), nil
+}
+
+func createNonNativeSegwitRedeemScript(witnessScript []byte) ([]byte, error) {
+    witnessScriptHash := sha256.Sum256(witnessScript)
+    
+    builder := txscript.NewScriptBuilder()
+    builder.AddInt64(0)
+    builder.AddData(witnessScriptHash[:])
+    
+    return builder.Script()
+}
+```
+
+## Submarine Swap V2
+
+### V2 Features
+
+- Uses MuSig for user/Muun keys
+- More efficient witness scripts
+- Better privacy
+- Lower fees
+
+### V2 Witness Script
+
+```go
+func createWitnessScriptV2(
+    userPublicKey []byte,
+    muunPublicKey []byte,
+    swapServerPublicKey []byte,
+    paymentHash256 []byte,
+    numBlocksForExpiration int64,
+) ([]byte, error) {
+    // Combine user and muun keys with MuSig
+    pubKeys := [][]byte{userPublicKey, muunPublicKey}
+    tweak := musig.KeySpendOnlyTweak()
+    
+    aggregateKey, err := musig.Musig2CombinePubKeysWithTweak(
+        musig.Musig2v040Muun,
+        pubKeys,
+        tweak,
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    aggregatedPublicKey := aggregateKey.FinalKey.SerializeCompressed()
+    
+    // Build script:
+    // <aggregated_pubkey> OP_CHECKSIGVERIFY OP_HASH160 <payment_hash> OP_EQUAL
+    // OP_IF
+    //     <swap_server_pubkey>
+    // OP_ELSE
+    //     <num_blocks> OP_CHECKSEQUENCEVERIFY OP_DROP
+    //     <aggregated_pubkey>
+    // OP_ENDIF
+    // OP_CHECKSIG
+    
+    builder := txscript.NewScriptBuilder()
+    builder.AddData(aggregatedPublicKey)
+    builder.AddOp(txscript.OP_CHECKSIGVERIFY)
+    builder.AddOp(txscript.OP_HASH160)
+    builder.AddData(ripemd160(paymentHash256))
+    builder.AddOp(txscript.OP_EQUAL)
+    builder.AddOp(txscript.OP_IF)
+    builder.AddData(swapServerPublicKey)
+    builder.AddOp(txscript.OP_ELSE)
+    builder.AddInt64(numBlocksForExpiration)
+    builder.AddOp(txscript.OP_CHECKSEQUENCEVERIFY)
+    builder.AddOp(txscript.OP_DROP)
+    builder.AddData(aggregatedPublicKey)
+    builder.AddOp(txscript.OP_ENDIF)
+    builder.AddOp(txscript.OP_CHECKSIG)
+    
+    return builder.Script()
+}
+
+func ripemd160(data []byte) []byte {
+    hasher := hash.New()
+    _, err := hasher.Write(data)
+    if err != nil {
+        panic("failed to hash")
+    }
+    return hasher.Sum([]byte{})
+}
+```
+
+### V2 Address Creation
+
+```go
+const (
+    SubmarineSwapV2 = 102
+)
+
+func createSwapAddressV2(
+    witnessScript []byte,
+    network *chaincfg.Params,
+) (string, error) {
+    // V2 uses native SegWit (P2WSH)
+    witnessScriptHash := sha256.Sum256(witnessScript)
+    
+    address, err := btcutil.NewAddressWitnessScriptHash(
+        witnessScriptHash[:],
+        network,
+    )
+    if err != nil {
+        return "", err
+    }
+    
+    return address.EncodeAddress(), nil
+}
+```
+
+## Swap Validation
+
+### Validating Swap Parameters
+
+<CodeGroup>
+
+```go Go (libwallet/swaps/swaps.go:79)
+func (swap *SubmarineSwap) Validate(
+    rawInvoice string,
+    userPublicKey *KeyDescriptor,
+    muunPublicKey *KeyDescriptor,
+    originalExpirationInBlocks int64,
+    network *chaincfg.Params,
+) error {
+    version := swap.FundingOutput.ScriptVersion
+    switch version {
+    case addresses.SubmarineSwapV1:
+        return swap.validateV1(
+            rawInvoice,
+            userPublicKey,
+            muunPublicKey,
+            network,
+        )
+    case addresses.SubmarineSwapV2:
+        return swap.validateV2(
+            rawInvoice,
+            userPublicKey,
+            muunPublicKey,
+            originalExpirationInBlocks,
+            network,
+        )
+    default:
+        return fmt.Errorf("unknown swap version %v", version)
+    }
+}
+```
+
+```swift iOS
+let swap: LibwalletSubmarineSwap = // from server
+
+do {
+    try swap.validate(
+        rawInvoice,
+        userPublicKey: userKey,
+        muunPublicKey: muunKey,
+        originalExpirationInBlocks: 144, // ~1 day
+        network: network
+    )
+    print("Swap is valid")
+} catch {
+    print("Invalid swap: \(error)")
+}
+```
+
+</CodeGroup>
+
+## Key Descriptor
+
+### KeyDescriptor Structure
+
+```go
+type KeyDescriptor struct {
+    Key  *hdkeychain.ExtendedKey
+    Path string
+}
+
+func (d *KeyDescriptor) DeriveTo(path string) (*hdkeychain.ExtendedKey, error) {
+    key := d.Key
+    
+    currentPath, err := hdpath.Parse(d.Path)
+    if err != nil {
+        return nil, fmt.Errorf("invalid current key path: %w", err)
+    }
+    targetPath, err := hdpath.Parse(path)
+    if err != nil {
+        return nil, fmt.Errorf("invalid target key path: %w", err)
+    }
+    indexes := targetPath.IndexesFrom(currentPath)
+    for _, index := range indexes {
+        var err error
+        var modifier uint32
+        if index.Hardened {
+            modifier = hdkeychain.HardenedKeyStart
+        }
+        key, err = key.Derive(index.Index | modifier)
+        if err != nil {
+            return nil, err
+        }
+    }
+    return key, nil
+}
+```
+
+## Spending Swap Outputs
+
+### With Preimage (Success)
+
+```go
+func spendSwapWithPreimage(
+    tx *wire.MsgTx,
+    index int,
+    witnessScript []byte,
+    preimage []byte,
+    userSignature []byte,
+    muunSignature []byte,
+) error {
+    // V2: User+Muun signature, preimage, script
+    witness := [][]byte{
+        userSignature,
+        muunSignature,
+        preimage,
+        []byte{1}, // Choose IF branch
+        witnessScript,
+    }
+    
+    tx.TxIn[index].Witness = witness
+    return nil
+}
+```
+
+### With Refund (Timeout)
+
+```go
+func spendSwapWithRefund(
+    tx *wire.MsgTx,
+    index int,
+    witnessScript []byte,
+    userSignature []byte,
+    muunSignature []byte,
+) error {
+    // V2: User+Muun signature, empty preimage (ELSE branch), script
+    witness := [][]byte{
+        userSignature,
+        muunSignature,
+        []byte{},  // Empty for ELSE branch
+        []byte{0}, // Choose ELSE branch
+        witnessScript,
+    }
+    
+    tx.TxIn[index].Witness = witness
+    return nil
+}
+```
+
+## Swap Coins
+
+### CoinSubmarineSwapV1
+
+```go
+type coinSubmarineSwapV1 struct {
+    Network         *chaincfg.Params
+    OutPoint        wire.OutPoint
+    KeyPath         string
+    Amount          btcutil.Amount
+    RefundAddress   string
+    PaymentHash256  []byte
+    ServerPublicKey []byte
+    LockTime        int64
+}
+
+func (c *coinSubmarineSwapV1) SignInput(
+    index int,
+    tx *wire.MsgTx,
+    userKey *HDPrivateKey,
+    muunKey *HDPublicKey,
+) error {
+    // Derive keys
+    derivedUserKey, err := userKey.DeriveTo(c.KeyPath)
+    if err != nil {
+        return err
+    }
+    
+    // Build witness script
+    witnessScript, err := createWitnessScriptV1(
+        c.RefundAddress,
+        c.ServerPublicKey,
+        c.PaymentHash256,
+        c.LockTime,
+        c.Network,
+    )
+    if err != nil {
+        return err
+    }
+    
+    // Sign for refund path
+    signature, err := c.signForRefund(
+        tx,
+        index,
+        witnessScript,
+        derivedUserKey,
+    )
+    if err != nil {
+        return err
+    }
+    
+    // Build witness
+    witness := [][]byte{
+        signature,
+        []byte{},  // Empty preimage (refund)
+        []byte{0}, // Choose ELSE branch
+        witnessScript,
+    }
+    
+    tx.TxIn[index].Witness = witness
+    return nil
+}
+```
+
+### CoinSubmarineSwapV2
+
+```go
+type coinSubmarineSwapV2 struct {
+    Network             *chaincfg.Params
+    OutPoint            wire.OutPoint
+    KeyPath             string
+    Amount              btcutil.Amount
+    PaymentHash256      []byte
+    UserPublicKey       []byte
+    MuunPublicKey       []byte
+    ServerPublicKey     []byte
+    BlocksForExpiration int64
+    ServerSignature     []byte
+}
+
+func (c *coinSubmarineSwapV2) SignInput(
+    index int,
+    tx *wire.MsgTx,
+    userKey *HDPrivateKey,
+    muunKey *HDPublicKey,
+) error {
+    // Derive keys
+    derivedUserKey, err := userKey.DeriveTo(c.KeyPath)
+    derivedMuunKey, err := muunKey.DeriveTo(c.KeyPath)
+    
+    // Build witness script
+    witnessScript, err := createWitnessScriptV2(
+        c.UserPublicKey,
+        c.MuunPublicKey,
+        c.ServerPublicKey,
+        c.PaymentHash256,
+        c.BlocksForExpiration,
+    )
+    if err != nil {
+        return err
+    }
+    
+    // Sign with MuSig
+    userSignature, err := c.signWithMusig(
+        tx,
+        index,
+        witnessScript,
+        derivedUserKey,
+        derivedMuunKey,
+    )
+    if err != nil {
+        return err
+    }
+    
+    // Combine signatures and build witness
+    tx.TxIn[index].Witness = c.buildWitness(
+        userSignature,
+        c.ServerSignature,
+        witnessScript,
+    )
+    
+    return nil
+}
+```
+
+## Complete Swap Flow
+
+### iOS Implementation
+
+```swift
+class SubmarineSwapManager {
+    func createSwap(
+        invoice: String,
+        amount: Int64
+    ) async throws -> SubmarineSwap {
+        // 1. Request swap from server
+        let swapRequest = SwapRequest(
+            invoice: invoice,
+            amount: amount
+        )
+        
+        let swapResponse = try await apiClient.createSwap(swapRequest)
+        
+        // 2. Validate swap parameters
+        let swap = try LibwalletSubmarineSwap(from: swapResponse)
+        
+        try swap.validate(
+            invoice,
+            userPublicKey: userKey,
+            muunPublicKey: muunKey,
+            originalExpirationInBlocks: 144,
+            network: network
+        )
+        
+        // 3. Create funding transaction
+        let fundingTx = try createFundingTransaction(
+            outputAddress: swap.fundingOutput.outputAddress,
+            amount: swap.fundingOutput.outputAmount
+        )
+        
+        // 4. Sign and broadcast
+        let signedTx = try fundingTx.sign(userPrivKey, muunKey)
+        try await broadcast(signedTx)
+        
+        return swap
+    }
+    
+    func refundExpiredSwap(
+        _ swap: SubmarineSwap
+    ) async throws {
+        // Check if swap can be refunded
+        guard swap.canRefund else {
+            throw SwapError.cannotRefund
+        }
+        
+        // Create refund transaction
+        let refundTx = try createRefundTransaction(swap)
+        
+        // Sign with both keys
+        let signedTx = try refundTx.fullySign(userPrivKey, muunPrivKey)
+        
+        // Broadcast refund
+        try await broadcast(signedTx)
+    }
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Validate Before Funding">
+    Always validate swap parameters before sending funds:
+    ```swift
+    do {
+        try swap.validate(
+            invoice,
+            userPublicKey: userKey,
+            muunPublicKey: muunKey,
+            originalExpirationInBlocks: expectedBlocks,
+            network: network
+        )
+    } catch {
+        // Don't fund invalid swaps
+        throw SwapError.invalidParameters
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Monitor Expiration">
+    Track swap expiration to enable refunds:
+    ```swift
+    func monitorSwapExpiration(_ swap: SubmarineSwap) {
+        let expiryBlock = swap.fundingOutput.expirationInBlocks
+        
+        // Poll current block height
+        Task {
+            while true {
+                let currentHeight = try await getBlockHeight()
+                
+                if currentHeight >= expiryBlock {
+                    // Swap can be refunded
+                    try await refundExpiredSwap(swap)
+                    break
+                }
+                
+                try await Task.sleep(nanoseconds: 60_000_000_000) // 1 min
+            }
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Store Swap Data Securely">
+    Persist swap information for recovery:
+    ```swift
+    struct PersistedSwap: Codable {
+        let swapId: String
+        let invoice: String
+        let preimage: Data?
+        let fundingTxId: String
+        let outputAddress: String
+        let amount: Int64
+        let expirationBlock: Int64
+        let scriptVersion: Int
+    }
+    
+    func persistSwap(_ swap: SubmarineSwap) throws {
+        let persisted = PersistedSwap(from: swap)
+        let data = try JSONEncoder().encode(persisted)
+        try database.save(data, forKey: swap.id)
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Handle Preimage Revelation">
+    Store and verify preimages:
+    ```swift
+    func verifyPreimage(
+        _ preimage: Data,
+        expectedHash: Data
+    ) -> Bool {
+        let hash = SHA256.hash(data: preimage)
+        return Data(hash) == expectedHash
+    }
+    
+    func onPreimageReceived(
+        _ preimage: Data,
+        for swap: SubmarineSwap
+    ) {
+        guard verifyPreimage(
+            preimage,
+            expectedHash: swap.fundingOutput.paymentHash
+        ) else {
+            print("Invalid preimage")
+            return
+        }
+        
+        // Store for potential recovery
+        try? database.savePreimage(preimage, for: swap.id)
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Error Handling
+
+```swift
+enum SwapError: Error {
+    case invalidVersion
+    case expiredInvoice
+    case amountMismatch
+    case invalidScript
+    case cannotRefund
+    case insufficientConfirmations
+    
+    var localizedDescription: String {
+        switch self {
+        case .invalidVersion:
+            return "Unsupported swap version"
+        case .expiredInvoice:
+            return "Lightning invoice has expired"
+        case .amountMismatch:
+            return "Swap amount doesn't match invoice"
+        case .invalidScript:
+            return "Invalid swap script"
+        case .cannotRefund:
+            return "Swap cannot be refunded yet"
+        case .insufficientConfirmations:
+            return "Waiting for confirmations"
+        }
+    }
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Lightning Invoices" icon="bolt" href="/libwallet/lightning/invoices">
+    Parse Lightning invoices for swaps
+  </Card>
+  <Card title="Transaction Signing" icon="signature" href="/libwallet/signing">
+    Sign swap funding and refund transactions
+  </Card>
+  <Card title="MuSig" icon="key" href="/libwallet/crypto/musig">
+    Understand MuSig in V2 swaps
+  </Card>
+  <Card title="Fee Estimation" icon="calculator" href="/libwallet/fee-estimation">
+    Calculate fees for swap transactions
+  </Card>
+</CardGroup>

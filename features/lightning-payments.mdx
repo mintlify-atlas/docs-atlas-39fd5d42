@@ -1,0 +1,416 @@
+---
+title: "Lightning Network Payments"
+description: "Fast and low-cost Lightning payments integrated seamlessly with on-chain Bitcoin"
+---
+
+## Overview
+
+Muun Wallet provides native Lightning Network support through submarine swaps, allowing you to receive Lightning payments without managing channels or liquidity. This unique approach combines the best of both Lightning and on-chain Bitcoin.
+
+<Info>
+Muun uses submarine swaps to convert Lightning payments to on-chain Bitcoin automatically. This means you can receive Lightning payments without opening channels or maintaining inbound liquidity.
+</Info>
+
+## How Lightning Works in Muun
+
+Unlike traditional Lightning wallets, Muun doesn't require you to manage Lightning channels:
+
+1. **Receiving Lightning**: Payments are converted to on-chain Bitcoin via submarine swap
+2. **Sending Lightning**: Your on-chain balance is used to fund Lightning payments via submarine swap
+3. **No Channel Management**: No need to open, close, or manage channels
+4. **Unified Balance**: One balance that works for both Lightning and on-chain
+
+## Receiving Lightning Payments
+
+### Generate Lightning Invoice
+
+<Steps>
+  <Step title="Open Receive Screen">
+    Navigate to the receive screen and select Lightning invoice option.
+  </Step>
+  
+  <Step title="Set Amount (Optional)">
+    Lightning invoices can include an amount or be amount-less for the sender to fill in.
+    
+    ```swift
+    func setAmount(_ bitcoinAmount: BitcoinAmountWithSelectedCurrency?) {
+        advancedOptionsView.setAmount(bitcoinAmount)
+    }
+    ```
+  </Step>
+  
+  <Step title="Set Expiration Time">
+    Choose how long the invoice remains valid. Default is typically 1 hour.
+    
+    ```swift
+    func displayInvoice(_ invoiceInfo: IncomingInvoiceInfo?) {
+        guard let invoiceInfo = invoiceInfo else {
+            qrCodeView.isLoading = true
+            return
+        }
+        
+        qrCodeView.data = invoiceInfo.rawInvoice.uppercased().data(using: .utf8)
+        qrCodeView.label = invoiceInfo.rawInvoice
+        
+        // Start expiration timer
+        self.invoiceInfo = invoiceInfo
+        startTimer()
+    }
+    ```
+  </Step>
+  
+  <Step title="Share Invoice">
+    Share the invoice string or QR code with the sender.
+  </Step>
+</Steps>
+
+### Invoice Expiration
+
+Lightning invoices expire after a set time period. Muun actively monitors and warns you:
+
+```swift
+// Expiration monitoring
+func updateTimer() {
+    guard let expirationTimeRemainingInSecs = invoiceInfo?.expirationTimeInSeconds,
+          let formattedTime = invoiceInfo?.formattedExpirationTime else {
+        return
+    }
+    
+    if expirationTimeRemainingInSecs <= 0 {
+        displayInvoiceExpiredViewAndStopTimer()
+        return
+    }
+    
+    advancedOptionsView.setExpirationTime(formattedTime)
+    
+    // Show warning when < 3 minutes remaining
+    if expirationTimeRemainingInSecs < 180 {
+        setExpirationNoticeHidden(false)
+        updateExpireLabel(formattedTime: formattedTime)
+    }
+}
+```
+
+<Warning>
+Lightning invoices typically expire after 1 hour. Generate a new invoice if the old one expires before payment is made.
+</Warning>
+
+#### Expiration States
+
+| Time Remaining | Behavior |
+|----------------|----------|
+| > 3 minutes | Normal display |
+| < 3 minutes | Warning banner appears |
+| 0 (expired) | Overlay blocks QR code, prompts for new invoice |
+
+### Invoice Format
+
+Lightning invoices contain encoded payment information:
+
+```swift
+struct IncomingInvoiceInfo {
+    let rawInvoice: String        // BOLT11 invoice string
+    let expiresAt: Double?        // Unix timestamp
+    
+    var expirationTimeInSeconds: Int? {
+        guard let expiresAt = expiresAt else {
+            return nil
+        }
+        return Int(expiresAt - Date().timeIntervalSince1970)
+    }
+    
+    var formattedExpirationTime: String? {
+        guard let seconds = expirationTimeInSeconds else {
+            return nil
+        }
+        
+        let formatter = DateFormatter()
+        if seconds < 60 * 60 {
+            formatter.dateFormat = "mm:ss"
+        } else {
+            formatter.dateFormat = "HH:mm:ss"
+        }
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter.string(from: Date(timeIntervalSince1970: Double(seconds)))
+    }
+}
+```
+
+## Sending Lightning Payments
+
+### Payment Flow
+
+When you send to a Lightning invoice, Muun handles the submarine swap automatically:
+
+<Steps>
+  <Step title="Scan or Paste Invoice">
+    Enter the BOLT11 Lightning invoice.
+    
+    ```swift
+    func start(invoice: LibwalletInvoice) {
+        do {
+            try stateMachine.withState { (state: NewopStartState) in
+                try state.resolve(invoice, network: Environment.current.network)
+            }
+        } catch {
+            Logger.fatal(error: error)
+        }
+    }
+    ```
+  </Step>
+  
+  <Step title="Resolve Payment Intent">
+    The app detects this is a Lightning payment and sets up the submarine swap:
+    
+    ```swift
+    private func handleResolveState(_ state: NewopResolveState) {
+        let paymentIntent = state.paymentIntent!.adapt()
+        
+        switch paymentIntent {
+        case .submarineSwap(let invoice):
+            // Set invoice expiration timer
+            delegate.setExpires(Double(invoice.expiry))
+        default:
+            // Handle other payment types
+        }
+    }
+    ```
+  </Step>
+  
+  <Step title="Calculate Swap Fees">
+    The validation step calculates the total cost including:
+    - Amount to send
+    - Lightning routing fees
+    - On-chain mining fees
+    - Swap service fees
+  </Step>
+  
+  <Step title="Confirm and Send">
+    Review the total amount and confirm the payment.
+    
+    ```swift
+    private func createOpSubmarineSwap(state: NewopConfirmLightningState) {
+        let operation = BuildOperationAction.swap(
+            submarineSwapCreated!.swap,
+            amount: state.amountInfo!.amount!.adapt(),
+            fee: state.validated!.swapInfo!.onchainFee!.adapt(),
+            description: state.note,
+            exchangeRateWindow: exchangeRateWindow,
+            outpoints: outpoints
+        )
+        
+        let params = state.validated!.swapInfo!.swapFees!.adapt()
+        
+        subscribeTo(
+            operationActions.newOperation(operation,
+                                        with: params,
+                                        maxAlternativeTransactionCount: maxAlternativeTransactionCount),
+            onSuccess: self.operationCreated
+        )
+    }
+    ```
+  </Step>
+</Steps>
+
+### Lightning Payment Fees
+
+Lightning payments through Muun include multiple fee components:
+
+<Accordion title="Routing Fees">
+  Lightning Network fees paid to nodes that route your payment. These are typically very small (fractions of a penny).
+  
+  ```swift
+  NewOpData.Confirm(
+      routingFeeInSat: state.routingFeesInSats,
+      // ... other parameters
+  )
+  ```
+</Accordion>
+
+<Accordion title="On-chain Fees">
+  Bitcoin network fees for the submarine swap transaction.
+  
+  ```swift
+  NewOpData.Confirm(
+      onchainFee: state.onchainFee,
+      // ... other parameters
+  )
+  ```
+</Accordion>
+
+<Accordion title="Swap Fees">
+  Service fees for the submarine swap operation that converts between Lightning and on-chain.
+</Accordion>
+
+<Note>
+Total Lightning payment fees in Muun may be higher than traditional Lightning wallets due to submarine swap costs, but you gain the benefit of not managing channels.
+</Note>
+
+## Submarine Swaps Explained
+
+Submarine swaps are atomic exchanges between Lightning and on-chain Bitcoin:
+
+### How It Works
+
+1. **Hash Lock**: Both parties commit to a secret hash
+2. **Lightning Payment**: Sender pays Lightning invoice
+3. **On-chain Settlement**: Receiver gets on-chain Bitcoin
+4. **Atomic**: Either completes fully or fails completely (no partial states)
+
+### Swap Parameters
+
+```swift
+private func createOpSubmarineSwap(state: NewopConfirmLightningState) {
+    let params = state.validated!.swapInfo!.swapFees!.adapt()
+    let maxAlternativeTransactionCount = submarineSwapCreated!.maxAlternativeTransactionCount
+    
+    operationActions.newOperation(
+        operation,
+        with: params,
+        maxAlternativeTransactionCount: maxAlternativeTransactionCount
+    )
+}
+```
+
+## Lightning Network Settings
+
+Muun provides settings to customize your Lightning experience:
+
+### Turbo Channels
+
+Turbo channels allow faster Lightning payments with trusted partners:
+
+```swift
+class TurboChannelSettingsTogglePresenter {
+    // Enable/disable turbo channel feature
+    // Allows zero-conf Lightning transactions
+}
+```
+
+### Advanced Options
+
+When receiving Lightning payments, you can configure:
+
+- **Invoice expiration time**: How long the invoice remains valid
+- **Amount specification**: Fixed amount or sender-determined
+- **Description**: Note attached to the invoice
+
+## One-Conf Payments
+
+For certain Lightning payments, Muun supports faster confirmation:
+
+```swift
+NewOpData.Confirm(
+    isOneConf: state.isOneConf,
+    confirmationsNeeded: state.confirmationsNeeded,
+    // ... other parameters
+)
+```
+
+<Info>
+One-conf payments are considered final after just one block confirmation instead of waiting for multiple confirmations, enabling faster Lightning-to-onchain settlements.
+</Info>
+
+## Error Handling
+
+### Common Lightning Errors
+
+<Accordion title="Invoice Missing Amount">
+  ```swift
+  func invoiceMissingAmount() {
+      delegate.invoiceMissingAmount()
+  }
+  ```
+  
+  Some invoices don't specify an amount. You'll be prompted to enter the payment amount.
+</Accordion>
+
+<Accordion title="Invoice Expired">
+  ```swift
+  case NewopOperationErrorInvoiceExpired:
+      delegate.expiredInvoice()
+  ```
+  
+  Lightning invoices expire. Request a new invoice from the recipient.
+</Accordion>
+
+<Accordion title="Swap Failed">
+  ```swift
+  if e.isKindOf(.swapFailed) {
+      delegate.showSwapFailedError()
+  }
+  ```
+  
+  The submarine swap couldn't complete. Funds are safe and will be returned to your wallet.
+</Accordion>
+
+<Accordion title="Exchange Rate Too Old">
+  ```swift
+  if e.isKindOf(.exchangeRateWindowTooOld) {
+      delegate.showExchangeRateWindowTooOldError()
+  }
+  ```
+  
+  The exchange rate data is stale. The app will fetch fresh rates and retry.
+</Accordion>
+
+## Technical Details
+
+### Payment State Machine
+
+Lightning payments are handled by the same state machine as on-chain payments:
+
+```swift
+switch state {
+case let state as NewopValidateLightningState:
+    handleValidateLightningState(state)
+    
+case let state as NewopConfirmLightningState:
+    handleConfirmLightningState(state)
+}
+```
+
+### Lightning-Specific States
+
+- `NewopValidateLightningState`: Validates invoice and calculates swap fees
+- `NewopConfirmLightningState`: Confirms Lightning payment with all fees calculated
+- Submarine swap creation and monitoring
+
+## Best Practices
+
+<Steps>
+  <Step title="Check Invoice Expiration">
+    Always verify the invoice hasn't expired before sharing it with the sender.
+  </Step>
+  
+  <Step title="Consider Fees">
+    Lightning payments through submarine swaps may have higher fees than direct Lightning. Use for appropriate transaction sizes.
+  </Step>
+  
+  <Step title="Verify Amount">
+    Double-check the amount in invoices, especially for large payments.
+  </Step>
+  
+  <Step title="Monitor Confirmations">
+    After receiving, wait for on-chain confirmations before considering large payments final.
+  </Step>
+</Steps>
+
+## Advantages of Muun's Approach
+
+- **No Channel Management**: Don't worry about opening, closing, or balancing channels
+- **No Liquidity Issues**: Always able to receive Lightning payments
+- **Unified Experience**: One balance for both Lightning and on-chain
+- **Self-Custodial**: You always control your keys
+- **Reliability**: Less complex than traditional Lightning wallets
+
+## Trade-offs
+
+- **Higher Fees**: Submarine swaps add costs compared to direct Lightning payments
+- **On-chain Settlement**: Received Lightning payments settle on-chain, requiring confirmation time
+- **Not Pure Lightning**: Uses hybrid approach rather than native Lightning channels
+
+## Related Features
+
+- [Sending & Receiving](/features/sending-receiving) - General payment guide
+- [Security Center](/features/security-center) - Secure your wallet

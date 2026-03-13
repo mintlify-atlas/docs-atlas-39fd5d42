@@ -1,0 +1,637 @@
+---
+title: 'Transaction Signing with MuSig2'
+description: 'Multi-party Taproot signatures using MuSig2 in Muun Wallet'
+---
+
+## Overview
+
+Muun uses MuSig2 for Taproot address signing, allowing 2-of-2 multisig transactions that appear as single-signature on-chain. This provides privacy and fee savings.
+
+## MuSig2 Versions
+
+Libwallet supports two MuSig2 implementations:
+
+```go
+type MusigVersion uint8
+
+const (
+    // Muun's variant based on secp256k1_zkp v0.4.0
+    Musig2v040Muun MusigVersion = 40
+    
+    // Standard BIP 327 (v1.0.0rc2)
+    Musig2v100 MusigVersion = 100
+)
+```
+
+### Version Selection by Address
+
+```go
+func MusigVersionForAddress(addressVersion int) musig.MusigVersion {
+    switch addressVersion {
+    case V1, V2, V3, V4, V5, SubmarineSwapV1, SubmarineSwapV2, IncomingSwap:
+        return musig.Musig2v040Muun
+    default:
+        return musig.Musig2v100
+    }
+}
+```
+
+- **V5 addresses**: Use Musig2v040Muun
+- **V6 addresses**: Use Musig2v100 (BIP 327)
+
+## Key Aggregation
+
+### Combining Public Keys
+
+<CodeGroup>
+
+```go Go (libwallet/musig/musig2.go:136)
+func Musig2CombinePubKeysWithTweak(
+    musigVersion MusigVersion,
+    pubKeys [][]byte,
+    tweaks *MuSig2Tweaks,
+) (*musig2v100.AggregateKey, error) {
+    keys, err := MuSig2ParsePubKeys(musigVersion, pubKeys)
+    if err != nil {
+        return nil, err
+    }
+    
+    return MuSig2CombineKeys(musigVersion, keys, tweaks)
+}
+```
+
+```swift iOS
+let userPubKey = userPrivKey.publicKey().key.serializeCompressed()
+let muunPubKey = muunKey.key.serializeCompressed()
+
+let pubKeys = [userPubKey, muunPubKey]
+let tweak = LibwalletKeySpendOnlyTweak()
+
+let aggregateKey = try! LibwalletMusig2CombinePubKeysWithTweak(
+    LibwalletMusig2v100,
+    pubKeys,
+    tweak
+)
+```
+
+</CodeGroup>
+
+### Tweaks for Taproot
+
+Taproot keys are tweaked using BIP 86 (key-spend only):
+
+```go
+func KeySpendOnlyTweak() *MuSig2Tweaks {
+    return &MuSig2Tweaks{
+        TaprootBIP0086Tweak: true,
+    }
+}
+```
+
+### MuSig2Tweaks Structure
+
+```go
+type MuSig2Tweaks struct {
+    TaprootBIP0086Tweak       bool
+    TaprootTweak              []byte
+    GenericTweaks             []musig2v100.KeyTweakDesc
+    UnhardenedDerivationPath  []uint32
+}
+```
+
+## Nonce Generation
+
+### Creating Nonces
+
+Nonces must be generated for each signature:
+
+<Tabs>
+  <Tab title="Go">
+    ```go
+    func MuSig2GenerateNonce(
+        musigVersion MusigVersion,
+        sessionId []byte,
+        publicKeyBytes []byte,
+    ) (*musig2v100.Nonces, error) {
+        switch musigVersion {
+        case Musig2v040Muun:
+            return musig2v040.GenNonces(
+                musig2v040.WithCustomRand(
+                    bytes.NewBuffer(sessionId),
+                ),
+            )
+        
+        case Musig2v100:
+            publicKey, err := ParsePubKey(musigVersion, publicKeyBytes)
+            if err != nil {
+                return nil, err
+            }
+            
+            return musig2v100.GenNonces(
+                musig2v100.WithPublicKey(publicKey),
+                musig2v100.WithCustomRand(bytes.NewBuffer(sessionId)),
+            )
+        }
+    }
+    ```
+  </Tab>
+  
+  <Tab title="Swift">
+    ```swift
+    let nonces = LibwalletNewMusigNonces()
+    
+    for input in inputs {
+        // Generate 32 random bytes for session ID
+        var sessionId = Data(count: 32)
+        sessionId.withUnsafeMutableBytes { ptr in
+            _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
+        }
+        
+        try! nonces.add(sessionId)
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### MusigNonces Type
+
+```swift
+class MusigNonces {
+    var sessionIds: [[UInt8]] = []
+    
+    func add(_ sessionId: Data) throws {
+        guard sessionId.count == 32 else {
+            throw MusigError.invalidSessionId
+        }
+        sessionIds.append([UInt8](sessionId))
+    }
+}
+```
+
+## Signing Process
+
+### Step 1: Create Signing Context
+
+```go
+func MuSig2CreateContext(
+    musigVersion MusigVersion,
+    privKey *btcec.PrivateKey,
+    allSignerPubKeys []*btcec.PublicKey,
+    tweaks *MuSig2Tweaks,
+    localNonces *musig2v100.Nonces,
+) (input.MuSig2Context, input.MuSig2Session, error)
+```
+
+### Step 2: Generate Partial Signature
+
+```go
+func MuSig2Sign(
+    session input.MuSig2Session,
+    msg [32]byte,
+) (*musig2v100.PartialSignature, error) {
+    switch s := session.(type) {
+    case *musig2v100.Session:
+        partialSig, err := s.Sign(msg, musig2v100.WithSortedKeys())
+        if err != nil {
+            return nil, fmt.Errorf("error signing with local key: %v", err)
+        }
+        return partialSig, nil
+        
+    case *musig2v040.Session:
+        partialSig, err := s.Sign(msg)
+        if err != nil {
+            return nil, fmt.Errorf("error signing with local key: %v", err)
+        }
+        return &musig2v100.PartialSignature{
+            S: partialSig.S,
+            R: partialSig.R,
+        }, nil
+    }
+}
+```
+
+### Step 3: Combine Signatures
+
+```go
+func MuSig2CombineSig(
+    session input.MuSig2Session,
+    otherPartialSig *musig2v100.PartialSignature,
+) (bool, error) {
+    switch s := session.(type) {
+    case *musig2v100.Session:
+        haveAllSigs, err := s.CombineSig(otherPartialSig)
+        if err != nil {
+            return false, fmt.Errorf("error combining partial signature: %v", err)
+        }
+        return haveAllSigs, nil
+        
+    case *musig2v040.Session:
+        haveAllSigs, err := s.CombineSig(&musig2v040.PartialSignature{
+            S: otherPartialSig.S,
+            R: otherPartialSig.R,
+        })
+        if err != nil {
+            return false, fmt.Errorf("error combining partial signature: %v", err)
+        }
+        return haveAllSigs, nil
+    }
+}
+```
+
+## Complete Signing Example
+
+### V5 Address Signing
+
+```go
+func (c *coinV5) SignInput(
+    index int,
+    tx *wire.MsgTx,
+    userKey *HDPrivateKey,
+    muunKey *HDPublicKey,
+) error {
+    // 1. Derive keys to path
+    derivedUserKey, err := userKey.DeriveTo(c.KeyPath)
+    if err != nil {
+        return fmt.Errorf("failed to derive user private key: %w", err)
+    }
+    
+    derivedMuunKey, err := muunKey.DeriveTo(c.KeyPath)
+    if err != nil {
+        return fmt.Errorf("failed to derive muun public key: %w", err)
+    }
+    
+    // 2. Get EC keys
+    userEcPriv, err := derivedUserKey.key.ECPrivKey()
+    if err != nil {
+        return fmt.Errorf("failed to obtain ECPrivKey: %w", err)
+    }
+    
+    muunEcPub, err := derivedMuunKey.key.ECPubKey()
+    if err != nil {
+        return fmt.Errorf("failed to obtain ECPubKey: %w", err)
+    }
+    
+    // 3. Calculate sighash
+    sigHash, err := txscriptw.CalcTaprootSigHash(
+        tx,
+        c.SigHashes,
+        index,
+        txscript.SigHashAll,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to create sigHash: %w", err)
+    }
+    
+    var toSign [32]byte
+    copy(toSign[:], sigHash)
+    
+    // 4. Sign with MuSig2
+    return c.signSecondWith(
+        index,
+        tx,
+        userEcPriv,
+        muunEcPub,
+        c.UserSessionId,
+        toSign,
+    )
+}
+```
+
+### iOS Complete Flow
+
+```swift
+func signTransaction(
+    pst: LibwalletPartiallySignedTransaction,
+    userPrivKey: LibwalletHDPrivateKey,
+    muunPubKey: LibwalletHDPublicKey
+) throws -> LibwalletTransaction {
+    // Sign will:
+    // 1. Generate user's partial signatures for each input
+    // 2. Combine with Muun's partial signatures (already in PST)
+    // 3. Create final schnorr signatures
+    // 4. Build complete transaction
+    
+    return try pst.sign(userPrivKey, muunPubKey)
+}
+```
+
+## Partial Signature Format
+
+### PartialSignature Structure
+
+```go
+type PartialSignature struct {
+    S *btcec.ModNScalar  // Scalar component
+    R *btcec.PublicKey   // Nonce point
+}
+```
+
+### Serialization
+
+```go
+func SerializePartialSignature(
+    sig *musig2v100.PartialSignature,
+) ([32]byte, error) {
+    var buf bytes.Buffer
+    if err := sig.Encode(&buf); err != nil {
+        return [32]byte{}, fmt.Errorf("error encoding partial signature: %v", err)
+    }
+    
+    var result [32]byte
+    copy(result[:], buf.Bytes())
+    return result, nil
+}
+```
+
+### Deserialization
+
+```go
+func DeserializePartialSignature(
+    scalarBytes []byte,
+) (*musig2v100.PartialSignature, error) {
+    if len(scalarBytes) != 32 {
+        return nil, fmt.Errorf("invalid partial signature length, got %d wanted 32",
+            len(scalarBytes))
+    }
+    
+    sig := &musig2v100.PartialSignature{}
+    if err := sig.Decode(bytes.NewReader(scalarBytes)); err != nil {
+        return nil, fmt.Errorf("error decoding partial signature: %w", err)
+    }
+    
+    return sig, nil
+}
+```
+
+## Key Parsing
+
+### ParsePubKey
+
+Different MuSig versions require different key formats:
+
+```go
+func ParsePubKey(
+    musigVersion MusigVersion,
+    pubKeyBytes []byte,
+) (*btcec.PublicKey, error) {
+    switch musigVersion {
+    case Musig2v040Muun:
+        // v0.4.0 uses x-only keys
+        if len(pubKeyBytes) == 33 {
+            // Remove parity byte if compressed format provided
+            pubKey, err := schnorr.ParsePubKey(pubKeyBytes[1:])
+            if err != nil {
+                return nil, fmt.Errorf("error parsing key for v0.4.0: %v", err)
+            }
+            return pubKey, nil
+        }
+        return schnorr.ParsePubKey(pubKeyBytes)
+        
+    case Musig2v100:
+        // v1.0.0 uses compressed keys
+        pubKey, err := btcec.ParsePubKey(pubKeyBytes)
+        if err != nil {
+            return nil, fmt.Errorf("error parsing key for v1.0.0: %v", err)
+        }
+        return pubKey, nil
+        
+    default:
+        return nil, fmt.Errorf("unknown MuSig2 version: %d", musigVersion)
+    }
+}
+```
+
+## Signature Verification
+
+### Verify Partial Signature
+
+```go
+func (p *PartialSignature) Verify(
+    pubNonce [66]byte,
+    combinedNonce [66]byte,
+    keySet []*btcec.PublicKey,
+    signingKey *btcec.PublicKey,
+    msg [32]byte,
+    signOpts ...SignOption,
+) bool {
+    return verifyPartialSig(
+        p,
+        pubNonce,
+        combinedNonce,
+        keySet,
+        schnorr.SerializePubKey(signingKey),
+        msg,
+        signOpts...,
+    ) == nil
+}
+```
+
+## Aggregation Coefficient
+
+The aggregation coefficient is calculated for each signer:
+
+```go
+func aggregationCoefficient(
+    keySet []*btcec.PublicKey,
+    targetKey *btcec.PublicKey,
+    keysHash []byte,
+    secondKeyIdx int,
+) *btcec.ModNScalar {
+    var mu btcec.ModNScalar
+    
+    // If this is the second key, coefficient is 1
+    if secondKeyIdx != -1 && keyBytesEqual(keySet[secondKeyIdx], targetKey) {
+        return mu.SetInt(1)
+    }
+    
+    // Otherwise compute: H(keysHash || targetKey)
+    var coefficientBytes [64]byte
+    copy(coefficientBytes[:], keysHash[:])
+    copy(coefficientBytes[32:], schnorr.SerializePubKey(targetKey))
+    
+    muHash := chainhash.TaggedHash(KeyAggTagCoeff, coefficientBytes[:])
+    mu.SetByteSlice(muHash[:])
+    
+    return &mu
+}
+```
+
+## Sighash Calculation
+
+### Taproot Sighash
+
+```go
+func CalcTaprootSigHash(
+    tx *wire.MsgTx,
+    sigHashes *TaprootSigHashes,
+    index int,
+    hashType txscript.SigHashType,
+) ([]byte, error) {
+    // Use cached sighashes for efficiency
+    return txscript.CalcTaprootSignatureHash(
+        sigHashes,
+        hashType,
+        tx,
+        index,
+        txscript.NewCannedPrevOutputFetcher(
+            sigHashes.PrevOutputs[index].PkScript,
+            sigHashes.PrevOutputs[index].Value,
+        ),
+    )
+}
+```
+
+### SigHashes Cache
+
+```go
+type TaprootSigHashes struct {
+    PrevOutputs []*wire.TxOut
+    // Cached hash values...
+}
+
+func NewTaprootSigHashes(
+    tx *wire.MsgTx,
+    prevOuts []*wire.TxOut,
+) *TaprootSigHashes {
+    return &TaprootSigHashes{
+        PrevOutputs: prevOuts,
+    }
+}
+```
+
+## Security Considerations
+
+<AccordionGroup>
+  <Accordion title="Never Reuse Nonces">
+    Reusing nonces breaks MuSig2 security:
+    ```swift
+    // ❌ WRONG - reusing session ID
+    let sessionId = Data(count: 32)
+    for _ in inputs {
+        nonces.add(sessionId) // DANGER!
+    }
+    
+    // ✅ CORRECT - unique session ID per input
+    for _ in inputs {
+        let sessionId = Data.random(count: 32)
+        nonces.add(sessionId)
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Verify Before Combining">
+    Always verify partial signatures before combining:
+    ```go
+    if !partialSig.Verify(pubNonce, combinedNonce, keySet, signingKey, msg) {
+        return nil, errors.New("invalid partial signature")
+    }
+    
+    haveAllSigs, err := session.CombineSig(partialSig)
+    ```
+  </Accordion>
+  
+  <Accordion title="Use Deterministic Nonces">
+    Generate nonces deterministically from session ID:
+    ```go
+    nonces, err := musig.MuSig2GenerateNonce(
+        musigVersion,
+        sessionId,
+        publicKeyBytes,
+    )
+    ```
+  </Accordion>
+  
+  <Accordion title="Validate Key Ordering">
+    MuSig2 v0.4.0 enforces [user, muun] key ordering:
+    ```go
+    // v0.4.0: keys are NOT sorted
+    sortKeys := musigVersion != Musig2v040Muun
+    
+    combinedKey, _, _, err := musig2v040.AggregateKeys(
+        allSignerPubKeys,
+        sortKeys, // false for v0.4.0
+        keyAggOpts...,
+    )
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Cache Aggregated Keys">
+    Key aggregation is expensive. Cache results:
+    ```swift
+    class KeyCache {
+        private var cache: [String: AggregateKey] = [:]
+        
+        func getAggregateKey(
+            userPubKey: Data,
+            muunPubKey: Data
+        ) throws -> AggregateKey {
+            let cacheKey = "\(userPubKey.hex)-\(muunPubKey.hex)"
+            
+            if let cached = cache[cacheKey] {
+                return cached
+            }
+            
+            let aggregated = try LibwalletMusig2CombinePubKeys(
+                musigVersion,
+                [userPubKey, muunPubKey],
+                tweaks
+            )
+            
+            cache[cacheKey] = aggregated
+            return aggregated
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Batch Sighash Calculation">
+    Calculate all sighashes at once for efficiency:
+    ```go
+    sigHashes := txscriptw.NewTaprootSigHashes(tx, prevOuts)
+    
+    for i, input := range inputs {
+        sigHash, err := txscriptw.CalcTaprootSigHash(
+            tx, sigHashes, i, txscript.SigHashAll,
+        )
+        // Use cached values from sigHashes
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Store Nonces Securely">
+    Session IDs must remain secret until signing:
+    ```swift
+    // Generate and store securely
+    let sessionId = Data.random(count: 32)
+    KeychainWrapper.set(sessionId, forKey: "session_\(inputIndex)")
+    
+    // Use for signing
+    let storedSessionId = KeychainWrapper.data(forKey: "session_\(inputIndex)")
+    try nonces.add(storedSessionId)
+    
+    // Delete after signing
+    KeychainWrapper.remove(forKey: "session_\(inputIndex)")
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="MuSig Cryptography" icon="lock" href="/libwallet/crypto/musig">
+    Deep dive into MuSig2 algorithms
+  </Card>
+  <Card title="Fee Estimation" icon="calculator" href="/libwallet/fee-estimation">
+    Calculate optimal fees for signed transactions
+  </Card>
+  <Card title="Key Management" icon="key" href="/libwallet/crypto/keys">
+    HD key derivation and management
+  </Card>
+  <Card title="Transaction Building" icon="hammer" href="/libwallet/transactions">
+    Create transactions ready for signing
+  </Card>
+</CardGroup>

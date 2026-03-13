@@ -1,0 +1,452 @@
+---
+title: Keychain
+description: iOS Keychain implementation for secure storage of sensitive data
+---
+
+## Overview
+
+The Muun iOS app uses the iOS Keychain to securely store sensitive data such as private keys, authentication tokens, and device tokens. The `KeychainRepository` provides a clean abstraction over the Keychain Services API.
+
+## KeychainRepository
+
+```swift
+public class KeychainRepository {
+    private let keyPrefix: String
+    private let group: String
+    
+    public enum storedKeys: String, CaseIterable {
+        case deviceCheckToken
+        case fallbackDeviceToken
+    }
+    
+    init(keyPrefix: String = Identifiers.bundleId,
+         group: String = Identifiers.group) {
+        self.keyPrefix = keyPrefix
+        self.group = group
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/KeychainRepository.swift:9`
+
+### Configuration
+
+<ParamField path="keyPrefix" type="String" default="Bundle ID">
+  Prefix for all keychain keys to avoid conflicts with other apps
+</ParamField>
+
+<ParamField path="group" type="String" default="App Group">
+  Keychain access group for sharing data between app and extensions
+</ParamField>
+
+## Core Operations
+
+### Store Data
+
+Store a string securely in the keychain:
+
+```swift
+public func store(_ string: String, at key: String) throws {
+    let data = string.data(using: .utf8, allowLossyConversion: true)
+    
+    let query = buildQuery(for: key, forInsert: true)
+    let toSet = [kSecValueData as String: data!]
+    
+    // Try to update first, then insert if not found
+    var status = SecItemUpdate(query as CFDictionary, toSet as CFDictionary)
+    if status == errSecItemNotFound {
+        let addQuery = query.merging(toSet) { (k, _) in k }
+        status = SecItemAdd(addQuery as CFDictionary, nil)
+    }
+    
+    guard status == errSecSuccess else {
+        throw MuunError(SecureStorage.Errors.secureStorageError)
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/KeychainRepository.swift:53`
+
+**Features:**
+- Attempts update first (idempotent)
+- Falls back to insert if key doesn't exist
+- Throws error on failure
+- UTF-8 encoding for strings
+
+### Retrieve Data
+
+Retrieve a stored string:
+
+```swift
+public func get(_ key: String) throws -> String {
+    var query = buildQuery(for: key, forInsert: false)
+    query[kSecReturnData as String] = true
+    
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    
+    guard status == errSecSuccess,
+        let value = item as? Data else {
+        throw MuunError(SecureStorage.Errors.secureStorageError)
+    }
+    
+    guard let ret = String(data: value, encoding: .utf8) else {
+        throw MuunError(SecureStorage.Errors.invalidData)
+    }
+    
+    return ret
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/KeychainRepository.swift:79`
+
+**Error Cases:**
+- `secureStorageError`: Key not found or access denied
+- `invalidData`: Data cannot be decoded as UTF-8
+
+### Check Existence
+
+Check if a key exists:
+
+```swift
+func has(_ key: String) throws -> Bool {
+    let query = buildQuery(for: key, forInsert: false)
+    let status = SecItemCopyMatching(query as CFDictionary, nil)
+    
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+        throw MuunError(SecureStorage.Errors.secureStorageError)
+    }
+    
+    return status == errSecSuccess
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/KeychainRepository.swift:101`
+
+### Delete Data
+
+Delete a keychain item:
+
+```swift
+public func delete(_ key: String) {
+    let query = buildQuery(for: key, forInsert: false)
+    SecItemDelete(query as CFDictionary)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/KeychainRepository.swift:45`
+
+### Wipe All Data
+
+Wipe all keychain data with optional PIN preservation:
+
+```swift
+func wipe(preservePin: Bool = false) {
+    var keychainStoredKeys = getKeychainStoredKeys()
+    
+    if preservePin {
+        do {
+            keychainStoredKeys[SecureStorage.Keys.pin.rawValue] = 
+                try get(SecureStorage.Keys.pin.rawValue)
+        } catch {
+            Logger.log(error: error)
+        }
+    }
+    
+    let dict: [NSString: Any] = [
+        kSecClass: kSecClassGenericPassword,
+        kSecAttrService: keyPrefix,
+        kSecAttrAccessGroup: group
+    ]
+    
+    let result = SecItemDelete(dict as CFDictionary)
+    
+    if result != noErr && result != errSecItemNotFound {
+        Logger.log(error: NSError(domain: "wipe_secure_storage_failed", code: Int(result)))
+    }
+    
+    // Restore preserved keys
+    keychainStoredKeys.forEach {
+        do {
+            try self.store($0.value, at: $0.key)
+        } catch {
+            Logger.log(error: error)
+        }
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/KeychainRepository.swift:115`
+
+## Query Building
+
+The repository builds secure keychain queries:
+
+```swift
+private func buildQuery(for key: String, forInsert: Bool) -> [String: Any] {
+    let scopedKey = tagFrom(key: key)
+    var query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrGeneric as String: scopedKey,
+        kSecAttrAccount as String: scopedKey,
+        kSecAttrService as String: keyPrefix,
+        kSecAttrAccessGroup as String: group
+    ]
+    
+    if forInsert {
+        query[kSecAttrSynchronizable as String] = false
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAlwaysThisDeviceOnly
+    }
+    
+    return query
+}
+
+private func tagFrom(key: String) -> Data {
+    return (keyPrefix + "." + key).data(using: .utf8)!
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/KeychainRepository.swift:29`
+
+### Query Attributes
+
+<ResponseField name="kSecClass" type="kSecClassGenericPassword">
+  Store as generic password (not certificate or key)
+</ResponseField>
+
+<ResponseField name="kSecAttrService" type="String">
+  Service identifier (app bundle ID)
+</ResponseField>
+
+<ResponseField name="kSecAttrAccessGroup" type="String">
+  Access group for sharing between app and extensions
+</ResponseField>
+
+<ResponseField name="kSecAttrSynchronizable" type="false">
+  Disable iCloud Keychain sync (sensitive data stays on device)
+</ResponseField>
+
+<ResponseField name="kSecAttrAccessible" type="kSecAttrAccessibleAlwaysThisDeviceOnly">
+  Data accessible always, but never backed up or synced
+</ResponseField>
+
+## Usage Examples
+
+<Tabs>
+  <Tab title="Basic Usage">
+    ```swift
+let keychain = KeychainRepository()
+
+// Store
+try keychain.store("my-secret-token", at: "authToken")
+
+// Retrieve
+let token = try keychain.get("authToken")
+print(token) // "my-secret-token"
+
+// Check existence
+if try keychain.has("authToken") {
+    print("Token exists")
+}
+
+// Delete
+keychain.delete("authToken")
+    ```
+  </Tab>
+  <Tab title="Error Handling">
+    ```swift
+do {
+    let privateKey = try keychain.get("privateKey")
+    // Use private key
+} catch let error as MuunError {
+    if let storageError = error.kind as? SecureStorage.Errors {
+        switch storageError {
+        case .secureStorageError:
+            print("Key not found or access denied")
+        case .invalidData:
+            print("Data corrupted")
+        }
+    }
+} catch {
+    print("Unexpected error: \(error)")
+}
+    ```
+  </Tab>
+  <Tab title="Wipe with Preservation">
+    ```swift
+// Wipe all data but keep PIN
+keychain.wipe(preservePin: true)
+
+// PIN is still available
+if let pin = try? keychain.get("pin") {
+    print("PIN preserved: \(pin)")
+}
+
+// Everything else is gone
+do {
+    _ = try keychain.get("authToken")
+} catch {
+    print("Token wiped") // This will print
+}
+    ```
+  </Tab>
+</Tabs>
+
+## SecureStorage Wrapper
+
+The `SecureStorage` class provides a higher-level API:
+
+```swift
+public class SecureStorage {
+    
+    enum Keys: String, CaseIterable {
+        case privateKey
+        case encriptedUserPrivateKey
+        case muunPrivateKey
+        case baseKeyDerivationPath
+        case pin
+        case authToken
+        case pinAttemptsLeft
+        case passwordSalt
+        case recoveryCodeSalt
+        case passwordPublicKey
+        case recoveryCodePublicKey
+        case userKeyPublicKey
+        case passwordVersionKey
+        case recoveryCodeVersionKey
+        case userVersionKey
+    }
+    
+    private let keychainRepository: KeychainRepository
+    
+    public init(keychainRepository: KeychainRepository) {
+        self.keychainRepository = keychainRepository
+    }
+    
+    func store(_ string: String, at key: Keys) throws {
+        try keychainRepository.store(string, at: key.rawValue)
+    }
+    
+    func get(_ key: Keys) throws -> String {
+        return try keychainRepository.get(key.rawValue)
+    }
+    
+    func has(_ key: Keys) throws -> Bool {
+        return try keychainRepository.has(key.rawValue)
+    }
+    
+    func delete(_ key: Keys) {
+        keychainRepository.delete(key.rawValue)
+    }
+    
+    func wipeAll(preservePin: Bool = false) {
+        keychainRepository.wipe(preservePin: preservePin)
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/SecureStorage.swift:11`
+
+### Predefined Keys
+
+The `Keys` enum defines all secure storage keys used by the app:
+
+<Tabs>
+  <Tab title="Cryptographic Keys">
+    - `privateKey`: User's Bitcoin private key
+    - `encriptedUserPrivateKey`: Encrypted user key
+    - `muunPrivateKey`: Muun co-signing key
+    - `userKeyPublicKey`: User's public key
+    - `baseKeyDerivationPath`: HD wallet derivation path
+  </Tab>
+  <Tab title="Authentication">
+    - `authToken`: API authentication token
+    - `pin`: User's PIN code
+    - `pinAttemptsLeft`: Remaining PIN attempts
+  </Tab>
+  <Tab title="Challenge Keys">
+    - `passwordSalt`: Password salt for key derivation
+    - `passwordPublicKey`: Password challenge public key
+    - `passwordVersionKey`: Password key version
+    - `recoveryCodeSalt`: Recovery code salt
+    - `recoveryCodePublicKey`: Recovery code public key
+    - `recoveryCodeVersionKey`: Recovery code version
+  </Tab>
+</Tabs>
+
+## Security Features
+
+### Access Control
+
+<Accordion title="Always This Device Only">
+  Data is never backed up to iCloud or synced across devices. This ensures sensitive keys stay on the device.
+</Accordion>
+
+<Accordion title="App Group Sharing">
+  Keychain data can be shared between the main app and extensions (e.g., notification extension) using the access group.
+</Accordion>
+
+<Accordion title="No Synchronization">
+  `kSecAttrSynchronizable = false` prevents iCloud Keychain sync for sensitive data.
+</Accordion>
+
+### Best Practices
+
+<AccordionGroup>
+  <Accordion title="Store Only Strings">
+    The repository stores strings only. Binary data should be hex-encoded or base64-encoded before storage.
+  </Accordion>
+
+  <Accordion title="Scoped Keys">
+    All keys are prefixed with bundle ID to avoid conflicts: `io.muun.falcon.privateKey`
+  </Accordion>
+
+  <Accordion title="Error Handling">
+    Always handle errors when accessing keychain. Keys may not exist or access may be denied.
+  </Accordion>
+
+  <Accordion title="Wipe on Logout">
+    Call `wipeAll()` when user logs out, optionally preserving PIN for convenience.
+  </Accordion>
+</AccordionGroup>
+
+## Integration with Architecture
+
+```swift
+// Data Layer
+let keychain = KeychainRepository()
+let secureStorage = SecureStorage(keychainRepository: keychain)
+
+// Store private key
+try secureStorage.store(privateKeyHex, at: .privateKey)
+
+// Repository uses secure storage
+class KeysRepository {
+    private let secureStorage: SecureStorage
+    
+    func getPrivateKey() throws -> String {
+        return try secureStorage.get(.privateKey)
+    }
+}
+
+// Domain layer uses repository
+class SignTransactionAction {
+    private let keysRepository: KeysRepository
+    
+    func run(transaction: Transaction) {
+        let privateKey = try keysRepository.getPrivateKey()
+        // Sign transaction
+    }
+}
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Secure Storage" icon="lock" href="/ios/data/secure-storage">
+    High-level secure storage API
+  </Card>
+  <Card title="Repositories" icon="box" href="/ios/data/repositories">
+    Data access layer
+  </Card>
+</CardGroup>

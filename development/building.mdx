@@ -1,0 +1,410 @@
+---
+title: Building
+description: Build configurations, schemes, and compilation process for the Muun Wallet iOS app
+---
+
+This guide covers the build process, configurations, and how to compile the Muun Wallet iOS app.
+
+## Build Overview
+
+The Muun app uses a multi-stage build process:
+
+<Steps>
+  <Step title="Build libwallet Rust components">
+    Rust code in `libwallet/librs` is compiled to static libraries
+  </Step>
+  <Step title="Build libwallet Go framework">
+    Go code is compiled with gomobile and linked with Rust libraries
+  </Step>
+  <Step title="Install CocoaPods dependencies">
+    Third-party iOS frameworks are downloaded and configured
+  </Step>
+  <Step title="Build Swift app">
+    The main iOS app links against libwallet and dependencies
+  </Step>
+</Steps>
+
+## Quick Build
+
+For day-to-day development, use Xcode:
+
+```bash
+cd falcon/app
+open falcon.xcworkspace
+```
+
+Then press **Cmd+B** to build or **Cmd+R** to run.
+
+## Build Targets
+
+The project contains multiple build targets:
+
+| Target | Description |
+|--------|-------------|
+| **Muun** | Main application target |
+| **falconTests** | Unit tests |
+| **falconUITests** | UI automation tests |
+| **falconPushNotifications** | Notification service extension |
+
+## Build Configurations
+
+The app supports multiple build configurations for different environments:
+
+<Accordion title="Production (prod)">
+  Points to the production Muun backend.
+  
+  **Use case:** Release builds for App Store
+  
+  ```bash
+  # Build via fastlane
+  bundle exec fastlane prd
+  ```
+</Accordion>
+
+<Accordion title="Dogfood">
+  Internal testing environment with production-like settings.
+  
+  **Use case:** Internal beta testing
+  
+  ```bash
+  bundle exec fastlane dogfood
+  ```
+</Accordion>
+
+<Accordion title="Development (dev)">
+  Points to development backend.
+  
+  **Use case:** Feature development and testing
+</Accordion>
+
+<Accordion title="Regtest">
+  Uses Bitcoin regtest network for local testing.
+  
+  **Use case:** Testing without real Bitcoin
+</Accordion>
+
+## Command-Line Build
+
+You can build from the command line using `xcodebuild`:
+
+### Build the app
+
+```bash
+cd falcon/app
+
+# Build for simulator
+xcodebuild \
+  -workspace falcon.xcworkspace \
+  -scheme Muun \
+  -configuration Debug \
+  -sdk iphonesimulator \
+  -destination 'platform=iOS Simulator,name=iPhone 15' \
+  build
+```
+
+### Build for device
+
+```bash
+xcodebuild \
+  -workspace falcon.xcworkspace \
+  -scheme Muun \
+  -configuration Release \
+  -sdk iphoneos \
+  -archivePath ./build/Muun.xcarchive \
+  archive
+```
+
+### Export IPA
+
+```bash
+xcodebuild \
+  -exportArchive \
+  -archivePath ./build/Muun.xcarchive \
+  -exportPath ./build \
+  -exportOptionsPlist ExportOptions.plist
+```
+
+## Libwallet Build Process
+
+The libwallet framework is automatically built during `pod install`, but you can rebuild it manually.
+
+### Manual Libwallet Build
+
+<Steps>
+  <Step title="Build Rust components">
+    ```bash
+    cd libwallet/librs
+    ./makelibs.sh
+    ```
+    
+    This creates:
+    - `libs/aarch64-apple-ios-librs.a` (device)
+    - `libs/x86_64-apple-ios-librs.a` (x86 simulator)
+    - `libs/aarch64-apple-ios-sim-librs.a` (ARM simulator)
+    - `libs/librs.xcframework` (combined framework)
+  </Step>
+
+  <Step title="Build Go framework">
+    ```bash
+    cd ..
+    ../tools/libwallet-ios.sh
+    ```
+    
+    This creates:
+    - `falcon/core/Libwallet.xcframework`
+    
+    The script uses caching to avoid unnecessary rebuilds by computing a shasum of all source files.
+  </Step>
+</Steps>
+
+### Skip Docker for Rust Build
+
+If you have Rust toolchains installed locally:
+
+```bash
+export USE_HOST_CARGO=1
+cd libwallet/librs
+./makelibs.sh
+```
+
+<Note>
+  This requires installing Rust targets manually:
+  ```bash
+  rustup target add aarch64-apple-ios
+  rustup target add x86_64-apple-ios
+  rustup target add aarch64-apple-ios-sim
+  ```
+</Note>
+
+## Build Scripts
+
+Key build scripts in the `tools/` directory:
+
+<CodeGroup>
+  ```bash tools/libwallet-ios.sh
+  #!/bin/bash
+  # Builds the Go libwallet framework for iOS
+  # - Calculates source shasum to detect changes
+  # - Runs gomobile bind with CGO flags
+  # - Creates Libwallet.xcframework in falcon/core/
+  
+  set -e
+  
+  repo_root=$(git rev-parse --show-toplevel)
+  build_dir="$repo_root/libwallet/.build"
+  libwallet="$repo_root/falcon/core/Libwallet.xcframework"
+  
+  # Check if rebuild is needed
+  if [ -e "$libwallet/libwallet.shasum" ]; then
+    current_shasum=$(calc_shasum "libwallet/")
+    previous_shasum=$(cat "${libwallet}/libwallet.shasum")
+    
+    if [[ "$current_shasum" == "$previous_shasum" ]]; then
+      echo "no rebuild needed"
+      exit
+    fi
+  fi
+  
+  # Build framework
+  CGO_LDFLAGS="-lresolv" \
+    go run golang.org/x/mobile/cmd/gomobile bind \
+    -target=ios,iossimulator -o "$libwallet" \
+    -iosversion="15.0" \
+    . ./newop ./app_provided_data ./libwallet_init
+  ```
+
+  ```bash tools/bootstrap-gomobile.sh
+  #!/bin/bash
+  # Installs gomobile and gobind to GOPATH
+  
+  repo_root=$(git rev-parse --show-toplevel)
+  build_dir="$repo_root/libwallet/.build"
+  
+  cd "$repo_root/libwallet" || exit
+  
+  mkdir -p "$build_dir/pkg"
+  
+  # Use shared dependency cache
+  GOMODCACHE="$build_dir/pkg" \
+    go install golang.org/x/mobile/cmd/gomobile && \
+    go install golang.org/x/mobile/cmd/gobind
+  ```
+
+  ```bash tools/ios-update-pods-registry.sh
+  #!/bin/bash
+  # Generates a registry of all CocoaPods dependencies
+  # Used for license compliance and dependency tracking
+  
+  pod list | tee pods_dependency_registry.txt
+  ```
+</CodeGroup>
+
+## Fastlane Automation
+
+The project uses [Fastlane](https://fastlane.tools) for build automation:
+
+### Install Fastlane
+
+```bash
+cd falcon/app
+bundle install
+```
+
+### Available Lanes
+
+<CodeGroup>
+  ```bash Production Release
+  # Build and upload to TestFlight
+  bundle exec fastlane prd
+  ```
+
+  ```bash Dogfood Build
+  # Build internal testing version
+  bundle exec fastlane dogfood
+  ```
+
+  ```bash Export IPA
+  # Export IPA without uploading
+  bundle exec fastlane export_prod_ipa
+  ```
+</CodeGroup>
+
+### Fastlane Configuration
+
+```ruby fastlane/Fastfile
+default_platform(:ios)
+
+platform :ios do
+  lane :prd do |options|
+    Actions.lane_context[SharedValues::ENVIRONMENT] = ENV_PROD
+    
+    version_number = get_version_number(target: "Muun")
+    
+    # Ensure clean git state
+    ensure_git_branch(branch: "^falcon-#{version_number}$")
+    ensure_git_status_clean
+    
+    upload_testflight(skip_internal_distribution: options[:skip_internal_distribution])
+  end
+end
+```
+
+## SwiftGen Code Generation
+
+The build process auto-generates Swift code for assets and strings:
+
+```bash
+# Run manually
+cd falcon/app
+Pods/SwiftGen/bin/swiftgen
+```
+
+This generates:
+- `falcon/Resource/Localization/Strings+Generated.swift`
+- `falcon/Resource/XCAssets+Generated.swift`
+
+<Note>
+  SwiftGen runs automatically during the build phase in Xcode, so you rarely need to run it manually.
+</Note>
+
+## SwiftLint
+
+Code linting runs automatically on build:
+
+```bash
+# Run manually
+cd falcon/app
+Pods/SwiftLint/swiftlint
+
+# Auto-fix issues
+Pods/SwiftLint/swiftlint --fix
+```
+
+Configuration is in `.swiftlint.yml`:
+
+```yaml
+line_length: 100
+warning_threshold: 1196
+
+excluded:
+  - Pods
+  - falconTests
+  - falcon/core/Protobuf
+
+custom_rules:
+  use_wrapped_error:
+    regex: ^\s*throw (?!MuunError)
+    severity: warning
+    message: replace with throw MuunError(...)
+```
+
+## Build Settings
+
+Key build settings configured in the project:
+
+| Setting | Value | Purpose |
+|---------|-------|----------|
+| `IPHONEOS_DEPLOYMENT_TARGET` | 15.0 | Minimum iOS version |
+| `SWIFT_VERSION` | 5.x | Swift language version |
+| `DEVELOPMENT_TEAM` | 5YYLBTUB6W | Apple Developer team |
+| `PRODUCT_BUNDLE_IDENTIFIER` | io.muun.falcon | App bundle ID |
+
+## Troubleshooting Builds
+
+<Accordion title="Libwallet build fails">
+  1. Check GOPATH is set:
+     ```bash
+     echo $GOPATH
+     ```
+  
+  2. Verify gomobile is installed:
+     ```bash
+     which gomobile
+     ```
+  
+  3. Clean and rebuild:
+     ```bash
+     rm -rf falcon/core/Libwallet.xcframework
+     ./tools/libwallet-ios.sh
+     ```
+</Accordion>
+
+<Accordion title="Pod install fails">
+  ```bash
+  # Clean pods
+  cd falcon/app
+  pod deintegrate
+  rm -rf Pods Podfile.lock
+  
+  # Reinstall
+  pod install
+  ```
+</Accordion>
+
+<Accordion title="Build cache issues">
+  ```bash
+  # Clean Xcode build cache
+  rm -rf ~/Library/Developer/Xcode/DerivedData
+  
+  # Clean libwallet build cache
+  rm -rf libwallet/.build
+  
+  # Rebuild
+  cd falcon/app
+  xcodebuild clean
+  xcodebuild build
+  ```
+</Accordion>
+
+<Accordion title="Signing errors">
+  For development builds, ensure:
+  1. You have a valid Apple Developer account
+  2. Automatic signing is enabled in Xcode
+  3. Your team is selected in **Signing & Capabilities**
+</Accordion>
+
+## Next Steps
+
+- Learn how to [run tests](/development/testing)
+- Understand the [project structure](/development/project-structure)
+- Set up your [development environment](/development/setup)

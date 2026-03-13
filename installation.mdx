@@ -1,0 +1,432 @@
+---
+title: 'Installation'
+description: 'Detailed guide for installing all dependencies required to build Muun Wallet iOS'
+---
+
+This guide covers detailed installation instructions for all dependencies needed to build and run the Muun Wallet iOS application.
+
+## System Requirements
+
+- **Operating System**: macOS 12.0 (Monterey) or later
+- **Xcode**: Version 14.0 or later
+- **RAM**: Minimum 8GB (16GB recommended for optimal build performance)
+- **Disk Space**: At least 20GB free space
+
+<Warning>
+  iOS development requires macOS. While you can build the libwallet library on Linux, the full iOS app must be built on macOS with Xcode.
+</Warning>
+
+## Xcode & Command Line Tools
+
+<Steps>
+  <Step title="Install Xcode">
+    Download Xcode from the Mac App Store or [Apple Developer](https://developer.apple.com/xcode/).
+
+    ```bash
+    # Verify installation
+    xcodebuild -version
+    ```
+
+    Expected output:
+    ```
+    Xcode 14.0
+    Build version 14A309
+    ```
+  </Step>
+
+  <Step title="Install Command Line Tools">
+    ```bash
+    xcode-select --install
+    ```
+
+    After installation, verify the tools are properly configured:
+
+    ```bash
+    xcode-select -p
+    ```
+
+    Expected output: `/Applications/Xcode.app/Contents/Developer`
+  </Step>
+
+  <Step title="Configure Command Line Tools in Xcode">
+    1. Open Xcode
+    2. Go to **Preferences** (Cmd + ,)
+    3. Navigate to **Locations** tab
+    4. Ensure **Command Line Tools** dropdown shows your Xcode version
+
+    <Info>
+      This step is critical. The build scripts (`makelibs.sh`, `libwallet-ios.sh`) use `lipo` and `xcodebuild`, which require properly configured Command Line Tools.
+    </Info>
+  </Step>
+</Steps>
+
+## Go (Golang)
+
+The libwallet module is written in Go and bridged to iOS using gomobile.
+
+<Steps>
+  <Step title="Install Go">
+    <CodeGroup>
+      ```bash Homebrew
+      brew install go
+      ```
+
+      ```bash Download from golang.org
+      # Download from https://golang.org/dl/
+      # Install the .pkg file
+      # Or extract to /usr/local:
+      tar -C /usr/local -xzf go*.tar.gz
+      ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Configure GOPATH">
+    Add these lines to your shell profile (`~/.zshrc` or `~/.bash_profile`):
+
+    ```bash
+    export GOPATH=$HOME/go
+    export PATH=$PATH:$GOPATH/bin
+    ```
+
+    Apply the changes:
+
+    ```bash
+    source ~/.zshrc
+    ```
+  </Step>
+
+  <Step title="Verify Installation">
+    ```bash
+    go version
+    echo $GOPATH
+    ```
+
+    Expected output:
+    ```
+    go version go1.21.0 darwin/arm64
+    /Users/yourusername/go
+    ```
+
+    <Warning>
+      The `GOPATH` must be set correctly. The Podfile saves it to `falcon/app/.gopath` during pod install, and `tools/libwallet-ios.sh` reads it for building the libwallet framework.
+    </Warning>
+  </Step>
+</Steps>
+
+## CocoaPods
+
+CocoaPods manages iOS dependencies including Firebase, RxSwift, and GRDB.
+
+<Steps>
+  <Step title="Install CocoaPods">
+    <CodeGroup>
+      ```bash Using Homebrew (Recommended)
+      brew install cocoapods
+      ```
+
+      ```bash Using RubyGems
+      sudo gem install cocoapods
+      ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Verify Installation">
+    ```bash
+    pod --version
+    ```
+
+    Expected output: `1.12.0` or later
+  </Step>
+
+  <Step title="Update CocoaPods Specs (Optional)">
+    ```bash
+    pod repo update
+    ```
+
+    <Info>
+      This updates the local specs repository. The Podfile uses `source 'https://cdn.cocoapods.org/'` for faster downloads.
+    </Info>
+  </Step>
+</Steps>
+
+### Key Dependencies Installed by CocoaPods
+
+The `falcon/app/Podfile` specifies:
+
+```ruby Podfile
+platform :ios, '15.0'
+
+target 'Muun' do
+  # Firebase for analytics and crash reporting
+  pod 'Firebase/Core'
+  pod 'Firebase/Messaging'
+  pod 'Firebase/Analytics'
+  pod 'Firebase/Crashlytics', '10.24.0'
+
+  # Google Drive integration for backups
+  pod 'GoogleSignIn', '7.1.0'
+  pod 'GoogleAPIClientForREST/Drive', '3.5.1'
+
+  # Development tools
+  pod 'SwiftLint', '0.50.1'
+  pod 'SwiftGen', '~> 6.0'
+  
+  # Core dependencies
+  pod 'Dip', '7.0.1'              # Dependency injection
+  pod 'GRDB.swift', '4.14.0'      # SQLite database
+  pod 'RxGRDB', '0.18.0'          # Reactive database queries
+  pod 'RxSwift', '5.0.1'          # Reactive programming
+  pod 'RxBlocking', '5.0.1'
+end
+```
+
+## Docker
+
+Docker is required to build the Rust bindings in `libwallet/librs`.
+
+<Steps>
+  <Step title="Install Docker Desktop">
+    Download and install [Docker Desktop for Mac](https://docs.docker.com/desktop/install/mac-install/).
+
+    Alternatively, using Homebrew:
+
+    ```bash
+    brew install --cask docker
+    ```
+  </Step>
+
+  <Step title="Start Docker">
+    Open Docker Desktop from Applications or start the daemon:
+
+    ```bash
+    open -a Docker
+    ```
+
+    Wait for Docker to fully start (whale icon appears in menu bar).
+  </Step>
+
+  <Step title="Verify Installation">
+    ```bash
+    docker --version
+    docker ps
+    ```
+
+    Expected output:
+    ```
+    Docker version 24.0.0, build abc1234
+    CONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES
+    ```
+  </Step>
+</Steps>
+
+### How Docker is Used
+
+The `libwallet/librs/makelibs.sh` script:
+
+1. Builds a Docker image with Rust toolchains for multiple targets:
+   ```bash
+   docker build --file libs.Dockerfile --tag librs-builder:latest \
+     --build-arg "TARGETS=aarch64-apple-ios x86_64-apple-ios aarch64-apple-ios-sim" .
+   ```
+
+2. Runs cargo builds inside the container:
+   ```bash
+   docker run -v "$repo_root:/src" -w "/src/$librs_path" \
+     librs-builder:latest cargo build --release -p bindings --target $target
+   ```
+
+3. Produces static libraries (`.a` files) for each iOS architecture
+
+<Note>
+  You can bypass Docker by setting `USE_HOST_CARGO=1` if you have Rust installed locally with all required targets. This is mainly for CI/CD reproducible builds.
+</Note>
+
+## Rust (Optional)
+
+Rust is only required if you want to build librs without Docker (`USE_HOST_CARGO=1`).
+
+<Steps>
+  <Step title="Install Rust">
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+  </Step>
+
+  <Step title="Add iOS Targets">
+    ```bash
+    rustup target add aarch64-apple-ios
+    rustup target add x86_64-apple-ios
+    rustup target add aarch64-apple-ios-sim
+    ```
+  </Step>
+
+  <Step title="Build Without Docker">
+    ```bash
+    export USE_HOST_CARGO=1
+    cd libwallet/librs
+    ./makelibs.sh
+    ```
+  </Step>
+</Steps>
+
+## Git
+
+<Steps>
+  <Step title="Install Git">
+    <CodeGroup>
+      ```bash Homebrew
+      brew install git
+      ```
+
+      ```bash Xcode Command Line Tools
+      # Git is included with Xcode Command Line Tools
+      git --version
+      ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Configure Git">
+    ```bash
+    git config --global user.name "Your Name"
+    git config --global user.email "your.email@example.com"
+    ```
+  </Step>
+</Steps>
+
+## Build Tools Summary
+
+Here's what each tool is used for:
+
+| Tool | Purpose | Used By |
+|------|---------|--------|
+| **Go** | libwallet core logic | `tools/libwallet-ios.sh` (gomobile bind) |
+| **gomobile** | Bridge Go to iOS | Generates `Libwallet.xcframework` |
+| **Docker** | Build Rust libraries | `libwallet/librs/makelibs.sh` |
+| **Rust** | Cryptographic verifiers | Compiles to `librs.xcframework` |
+| **CocoaPods** | iOS dependency manager | Installs Firebase, RxSwift, GRDB, etc. |
+| **Xcode** | Build and run iOS app | Main development environment |
+| **lipo** | Combine architectures | Creates fat binaries for simulator targets |
+| **xcodebuild** | Create frameworks | Packages libraries into .xcframework |
+
+## Verification Checklist
+
+Before proceeding to build the app, verify all dependencies:
+
+<Steps>
+  <Step title="Run verification commands">
+    ```bash
+    # Xcode
+    xcodebuild -version
+    xcode-select -p
+
+    # Go
+    go version
+    echo $GOPATH
+
+    # CocoaPods
+    pod --version
+
+    # Docker
+    docker --version
+    docker ps
+
+    # Git
+    git --version
+    ```
+  </Step>
+
+  <Step title="Check for required build tools">
+    ```bash
+    which lipo
+    which xcodebuild
+    which gomobile  # May not exist until bootstrap-gomobile.sh runs
+    ```
+
+    <Info>
+      It's normal if `gomobile` is not found yet. It will be installed when you run `tools/bootstrap-gomobile.sh` or during `pod install`.
+    </Info>
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="GOPATH not set error">
+    Add to your shell profile and restart terminal:
+
+    ```bash
+    echo 'export GOPATH=$HOME/go' >> ~/.zshrc
+    echo 'export PATH=$PATH:$GOPATH/bin' >> ~/.zshrc
+    source ~/.zshrc
+    ```
+  </Accordion>
+
+  <Accordion title="Docker daemon not running">
+    Start Docker Desktop:
+
+    ```bash
+    open -a Docker
+    ```
+
+    Wait until the whale icon appears in your menu bar, then retry.
+  </Accordion>
+
+  <Accordion title="CocoaPods installation fails with gem permissions">
+    Don't use `sudo` with Homebrew-managed Ruby. Instead:
+
+    ```bash
+    # Uninstall if installed with sudo
+    sudo gem uninstall cocoapods
+
+    # Install via Homebrew
+    brew install cocoapods
+    ```
+  </Accordion>
+
+  <Accordion title="xcode-select: command line tools not found">
+    Reset and reinstall:
+
+    ```bash
+    sudo rm -rf /Library/Developer/CommandLineTools
+    xcode-select --install
+    ```
+  </Accordion>
+
+  <Accordion title="lipo or xcodebuild not found">
+    These tools come with Xcode Command Line Tools. Ensure they're properly configured:
+
+    ```bash
+    sudo xcode-select --reset
+    sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+    ```
+  </Accordion>
+
+  <Accordion title="makelibs.sh fails with Rust target errors">
+    If using `USE_HOST_CARGO=1`, ensure all iOS targets are installed:
+
+    ```bash
+    rustup target list --installed | grep apple-ios
+    ```
+
+    Should show:
+    ```
+    aarch64-apple-ios
+    aarch64-apple-ios-sim
+    x86_64-apple-ios
+    ```
+
+    If missing, add them:
+
+    ```bash
+    rustup target add aarch64-apple-ios x86_64-apple-ios aarch64-apple-ios-sim
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+Once all dependencies are installed, proceed to the [Quickstart Guide](/quickstart) to build and run the app.
+
+<Card title="Quickstart" icon="rocket" href="/quickstart">
+  Clone the repo and get the app running in under 10 minutes
+</Card>

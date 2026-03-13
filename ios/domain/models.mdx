@@ -1,0 +1,569 @@
+---
+title: Domain Models
+description: Domain models representing business entities in Muun iOS app
+---
+
+## Overview
+
+Domain models represent the core business entities in the Muun Wallet. These are pure Swift structs and enums that encapsulate business logic and are independent of any framework or data source.
+
+## Core Models
+
+### Operation
+
+Represents a Bitcoin or Lightning transaction:
+
+```swift
+public struct Operation {
+    public let id: Int?
+    public let requestId: String
+    public let isExternal: Bool
+    public let direction: OperationDirection
+    
+    public let senderProfile: PublicProfile?
+    public let senderIsExternal: Bool
+    
+    public let receiverProfile: PublicProfile?
+    public let receiverIsExternal: Bool
+    public let receiverAddress: String?
+    public let receiverAddressDerivationPath: String?
+    
+    public let amount: BitcoinAmount
+    public let fee: BitcoinAmount
+    public var confirmations: Int?
+    public let exchangeRatesWindowId: Int
+    public var description: String?
+    public var status: OperationStatus
+    public var transaction: Transaction?
+    public let creationDate: Date
+    
+    public var submarineSwap: SubmarineSwap?
+    public let outpoints: [String]?
+    public let incomingSwap: IncomingSwap?
+    public var metadata: OperationMetadataJson?
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Model/Operations/Operation.swift:11`
+
+#### Business Logic Methods
+
+```swift
+// Check if operation can be canceled (RBF)
+public func isCancelable() -> Bool {
+    return transaction?.isReplaceableByFee ?? false
+        && isPending()
+}
+
+// Check if operation is pending
+public func isPending() -> Bool {
+    return OperationStatus.pendingStates.contains(status)
+}
+
+// Calculate total fees (on-chain + off-chain)
+public func totalFeeInSatoshis() -> Satoshis {
+    return fee.inSatoshis + offChainFeeInSatoshis()
+}
+
+private func offChainFeeInSatoshis() -> Satoshis {
+    if let swap = submarineSwap {
+        if let debtType = swap._fundingOutput._debtType, debtType == .LEND {
+            return swap._fees?._lightning ?? Satoshis(value: 0)
+        } else {
+            return swap._fees?.total() ?? Satoshis(value: 0)
+        }
+    }
+    return Satoshis(value: 0)
+}
+
+// Check if operation failed and was outgoing
+public func isFailedAndOutgoing() -> Bool {
+    return status == .FAILED && direction == .OUTGOING
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Model/Operations/Operation.swift:90`
+
+### OperationDirection
+
+```swift
+public enum OperationDirection: String, Codable {
+    case INCOMING  // Received by user
+    case OUTGOING  // Sent by user
+    case CYCLICAL  // To self (same user)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Model/Operations/Operation.swift:121`
+
+### OperationStatus
+
+```swift
+public enum OperationStatus: String, Codable {
+    case CREATED                 // Newly created, unsigned
+    case SIGNING                 // Being signed
+    case SIGNED                  // Signed but not broadcasted
+    case BROADCASTED             // Broadcasted, awaiting confirmation
+    case SWAP_PENDING            // Submarine swap: on-chain confirmed, awaiting off-chain
+    case SWAP_OPENING_CHANNEL    // Opening Lightning channel
+    case SWAP_WAITING_CHANNEL    // Waiting for channel to open
+    case SWAP_ROUTING            // Routing Lightning payment
+    case SWAP_PAYED              // Lightning payment successful
+    case SWAP_FAILED             // Lightning payment failed
+    case SWAP_EXPIRED            // Swap expired, funds time-locked
+    case CONFIRMED               // Confirmed but not settled
+    case SETTLED                 // Fully confirmed (6+ confirmations)
+    case DROPPED                 // Not found in recent blockchain sync
+    case FAILED                  // Rejected by network
+    
+    static let pendingStates: [OperationStatus] = [
+        .CREATED, .SIGNING, .SIGNED, .BROADCASTED,
+        .SWAP_PENDING, .SWAP_OPENING_CHANNEL,
+        .SWAP_WAITING_CHANNEL, .SWAP_ROUTING
+    ]
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Model/Operations/Operation.swift:140`
+
+## User Model
+
+```swift
+public struct User: Codable {
+    public let id: Int
+    let firstName: String?
+    let lastName: String?
+    public var email: String?
+    let phoneNumber: PhoneNumber?
+    let profilePictureUrl: String?
+    var primaryCurrency: String
+    public var isEmailVerified: Bool
+    var hasPasswordChallengeKey: Bool
+    var hasRecoveryCodeChallengeKey: Bool
+    let hasP2PEnabled: Bool
+    
+    var hasExportedKeys: Bool?
+    public let createdAt: Date?
+    var emergencyKit: ExportEmergencyKit?
+    var exportedKitVersions: [Int]?
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Model/UserAndProfile/User/User.swift:11`
+
+### User Methods
+
+<Tabs>
+  <Tab title="Currency">
+    ```swift
+public func primaryCurrencyWithValidExchangeRate(window: ExchangeRateWindow) -> String {
+    if primaryCurrency != "BTC" && window.rates[primaryCurrency] != nil {
+        return primaryCurrency
+    }
+    return "BTC"
+}
+
+public mutating func setPrimaryCurrency(_ currency: String) {
+    primaryCurrency = currency
+}
+
+public func unsafeGetPrimaryCurrency() -> String {
+    return primaryCurrency
+}
+    ```
+  </Tab>
+  <Tab title="Emergency Kit">
+    ```swift
+func hasExportedEmergencyKit() -> Bool {
+    return emergencyKit != nil
+}
+    ```
+  </Tab>
+  <Tab title="Support ID">
+    ```swift
+public func getSupportId() -> String? {
+    guard let date = createdAt else {
+        return nil
+    }
+    
+    // Convert to epoch and get last 8 digits
+    let epoch = Int(date.timeIntervalSince1970).description
+    var customId = String(epoch.suffix(8))
+    
+    // Insert hyphen: 1234-5678
+    customId.insert("-", at: customId.index(customId.startIndex, offsetBy: 4))
+    return customId
+}
+    ```
+  </Tab>
+</Tabs>
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Model/UserAndProfile/User/User.swift:39`
+
+### UserPreferences
+
+```swift
+public struct UserPreferences: Codable {
+    public let receiveStrictMode: Bool
+    public let seenNewHome: Bool
+    public let seenLnurlFirstTime: Bool
+    public let skippedEmailSetup: Bool
+    public let defaultAddressType: AddressType
+    public let receiveFormatPreference: ReceiveFormatPreference
+    
+    public func copy(
+        receiveStrictMode: Bool? = nil,
+        seenNewHome: Bool? = nil,
+        seenLnurlFirstTime: Bool? = nil,
+        skippedEmailSetup: Bool? = nil,
+        defaultAddressType: AddressType? = nil,
+        receiveFormatPreference: ReceiveFormatPreference? = nil
+    ) -> UserPreferences {
+        return UserPreferences(
+            receiveStrictMode: receiveStrictMode ?? self.receiveStrictMode,
+            seenNewHome: seenNewHome ?? self.seenNewHome,
+            seenLnurlFirstTime: seenLnurlFirstTime ?? self.seenLnurlFirstTime,
+            skippedEmailSetup: skippedEmailSetup ?? self.skippedEmailSetup,
+            defaultAddressType: defaultAddressType ?? self.defaultAddressType,
+            receiveFormatPreference: receiveFormatPreference ?? self.receiveFormatPreference
+        )
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Model/UserAndProfile/User/User.swift:119`
+
+### EmergencyKit
+
+```swift
+public struct ExportEmergencyKit: Codable {
+    let lastExportedAt: Date
+    let verificationCode: String
+    let verified: Bool
+    let version: Int
+    let method: Method?
+    
+    public enum Method: String, RawRepresentable, Codable {
+        case icloud
+        case drive
+        case manual
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Model/UserAndProfile/User/User.swift:94`
+
+## Model Organization
+
+### By Domain
+
+<Tabs>
+  <Tab title="Operations">
+    - `Operation`: Transaction/payment entity
+    - `OperationStatus`: Transaction state
+    - `OperationDirection`: Payment direction
+    - `BitcoinAmount`: Amount representation
+    - `Transaction`: On-chain transaction details
+  </Tab>
+  <Tab title="Swaps">
+    - `SubmarineSwap`: Lightning submarine swap
+    - `IncomingSwap`: Incoming Lightning payment
+    - `IncomingSwapHtlc`: HTLC details
+  </Tab>
+  <Tab title="User & Profile">
+    - `User`: User account
+    - `UserPreferences`: User settings
+    - `PublicProfile`: Contact profile
+    - `PhoneNumber`: Phone verification
+    - `ExportEmergencyKit`: Emergency kit export
+  </Tab>
+  <Tab title="Cryptographic">
+    - `Challenge`: Authentication challenge
+    - `RecoveryCode`: Recovery code
+    - `KeySet`: Cryptographic keys
+    - `AddressType`: Bitcoin address type
+  </Tab>
+  <Tab title="Real-Time Data">
+    - `ExchangeRateWindow`: Exchange rates
+    - `FeeWindow`: Fee estimates
+    - `BlockchainHeight`: Sync state
+    - `NextTransactionSize`: UTXO state
+  </Tab>
+</Tabs>
+
+## Common Patterns
+
+### Immutable Structs
+
+Most models are immutable structs:
+
+```swift
+public struct Operation {
+    public let id: Int?
+    public let direction: OperationDirection
+    // Properties are let (immutable)
+    
+    // Create new instance for updates
+    func withStatus(_ newStatus: OperationStatus) -> Operation {
+        return Operation(
+            id: self.id,
+            direction: self.direction,
+            status: newStatus,
+            // ... copy other properties
+        )
+    }
+}
+```
+
+### Business Logic in Models
+
+Models contain domain logic:
+
+```swift
+public struct Operation {
+    // Business rules encoded in the model
+    public func isCancelable() -> Bool {
+        return transaction?.isReplaceableByFee ?? false && isPending()
+    }
+    
+    public func isPending() -> Bool {
+        return OperationStatus.pendingStates.contains(status)
+    }
+    
+    public func totalFeeInSatoshis() -> Satoshis {
+        return fee.inSatoshis + offChainFeeInSatoshis()
+    }
+}
+```
+
+### Codable for Serialization
+
+All models conform to `Codable`:
+
+```swift
+public struct User: Codable {
+    public let id: Int
+    let firstName: String?
+    // Automatically encoded/decoded to/from JSON
+}
+
+// Usage
+let encoder = JSONEncoder()
+let data = try encoder.encode(user)
+
+let decoder = JSONDecoder()
+let user = try decoder.decode(User.self, from: data)
+```
+
+### Enums with Raw Values
+
+```swift
+public enum OperationStatus: String, Codable {
+    case CREATED
+    case BROADCASTED
+    case CONFIRMED
+    
+    // Serialized as string
+}
+
+// From database
+let status = OperationStatus(rawValue: "BROADCASTED")!
+
+// To database
+let statusString = status.rawValue // "BROADCASTED"
+```
+
+## Value Types
+
+### BitcoinAmount
+
+```swift
+public struct BitcoinAmount {
+    public let inSatoshis: Satoshis
+    public let inInputCurrency: MonetaryAmount
+    public let inPrimaryCurrency: MonetaryAmount
+}
+
+public struct Satoshis {
+    public let value: Int
+    
+    public func toBTC() -> Decimal {
+        return Decimal(value) / 100_000_000
+    }
+}
+
+public struct MonetaryAmount {
+    public let amount: Decimal
+    public let currency: String
+}
+```
+
+### AddressType
+
+```swift
+public enum AddressType: String, Codable {
+    case segwit      // Native SegWit (bc1)
+    case legacy      // Legacy (1...)
+    case compatible  // P2SH-wrapped SegWit (3...)
+}
+```
+
+## Model Conversion
+
+### Database to Domain
+
+```swift
+// Database model
+struct OperationDB: DatabaseModel {
+    var id: Int
+    var status: String
+    var amountInSatoshis: Int
+    
+    func to(using db: Database) throws -> Operation {
+        return Operation(
+            id: id,
+            status: OperationStatus(rawValue: status)!,
+            amount: BitcoinAmount(
+                inSatoshis: Satoshis(value: amountInSatoshis)
+            )
+        )
+    }
+}
+
+// Domain model
+public struct Operation {
+    public let id: Int?
+    public var status: OperationStatus
+    public let amount: BitcoinAmount
+}
+```
+
+### DTO to Domain
+
+```swift
+// DTO from API
+struct OperationJson: Codable {
+    let id: Int
+    let status: String
+    let amount: AmountJson
+    
+    func toModel() -> Operation {
+        return Operation(
+            id: id,
+            status: OperationStatus(rawValue: status)!,
+            amount: amount.toModel()
+        )
+    }
+}
+
+struct AmountJson: Codable {
+    let inSatoshis: Int
+    let inInputCurrency: MonetaryAmountJson
+    
+    func toModel() -> BitcoinAmount {
+        return BitcoinAmount(
+            inSatoshis: Satoshis(value: inSatoshis),
+            inInputCurrency: inInputCurrency.toModel()
+        )
+    }
+}
+```
+
+## Model Guidelines
+
+<AccordionGroup>
+  <Accordion title="Pure Swift">
+    Domain models should not depend on UIKit, Foundation (except basic types), or any framework. This makes them portable and testable.
+  </Accordion>
+
+  <Accordion title="Immutability">
+    Prefer immutable `let` properties. Use `copy()` methods or `with*()` methods for updates.
+  </Accordion>
+
+  <Accordion title="Value Semantics">
+    Use `struct` instead of `class` to get value semantics (copy on mutation).
+  </Accordion>
+
+  <Accordion title="Business Logic">
+    Encapsulate domain rules in the model. For example, `isCancelable()` instead of checking conditions in multiple places.
+  </Accordion>
+
+  <Accordion title="Codable">
+    Implement `Codable` for serialization to JSON/database. Use custom coding keys if needed.
+  </Accordion>
+
+  <Accordion title="Optionals">
+    Use optionals (`?`) for nullable fields, not sentinel values like -1 or empty strings.
+  </Accordion>
+</AccordionGroup>
+
+## Example Usage
+
+### In Repository
+
+```swift
+class OperationRepository: BaseDatabaseRepository<OperationDB, Operation> {
+    
+    func getPendingOperations() -> [Operation] {
+        let query = OperationDB
+            .filter(OperationStatus.pendingStates.map { $0.rawValue }
+                .contains(Column("status")))
+        
+        return objects(query: query) ?? []
+    }
+}
+```
+
+### In Use Case
+
+```swift
+class CancelOperationAction: AsyncAction<Operation> {
+    
+    func run(operationId: Int) {
+        let single = Single.deferred { [weak self] in
+            guard let operation = self?.operationRepository.object(with: operationId),
+                  operation.isCancelable() else {
+                throw OperationError.notCancelable
+            }
+            
+            return self?.houstonService.cancelOperation(operationId) ?? .error(MuunError())
+        }
+        
+        runSingle(single)
+    }
+}
+```
+
+### In View Controller
+
+```swift
+class OperationDetailViewController: MUViewController {
+    
+    let operation: Operation
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        
+        // Use domain model directly
+        amountLabel.text = formatBitcoin(operation.amount.inSatoshis)
+        statusLabel.text = operation.status.rawValue
+        
+        // Business logic in model
+        cancelButton.isEnabled = operation.isCancelable()
+        
+        // Computed properties
+        feeLabel.text = formatBitcoin(operation.totalFeeInSatoshis())
+    }
+}
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Use Cases" icon="gears" href="/ios/domain/use-cases">
+    Use cases that operate on models
+  </Card>
+  <Card title="Repositories" icon="database" href="/ios/data/repositories">
+    Data access for models
+  </Card>
+</CardGroup>

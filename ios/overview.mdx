@@ -1,0 +1,162 @@
+---
+title: iOS App Overview
+description: Overview of the Muun Wallet iOS application architecture and technology stack
+---
+
+## Introduction
+
+The Muun Wallet iOS app (codenamed "Falcon") is built using Swift and follows a clean, layered architecture pattern. The app implements a self-custodial Bitcoin and Lightning wallet with advanced security features.
+
+## Technology Stack
+
+<Tabs>
+  <Tab title="Core Technologies">
+    - **Language**: Swift 5+
+    - **Database**: GRDB (SQLite wrapper)
+    - **Reactive Programming**: RxSwift
+    - **Secure Storage**: iOS Keychain
+    - **Networking**: URLSession with custom BaseService
+  </Tab>
+  <Tab title="Key Libraries">
+    - **GRDB**: SQLite database with reactive queries
+    - **RxGRDB**: Reactive extensions for GRDB
+    - **Libwallet**: Custom Go library for Bitcoin operations
+    - **RxSwift**: Reactive programming framework
+  </Tab>
+</Tabs>
+
+## Architecture Overview
+
+The app follows a three-layer architecture pattern:
+
+```swift
+┌─────────────────────────────────────┐
+│      Presentation Layer             │
+│  (ViewControllers, Views, UI)       │
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│        Domain Layer                 │
+│  (Use Cases, Models, Business Logic)│
+└──────────────┬──────────────────────┘
+               │
+┌──────────────▼──────────────────────┐
+│         Data Layer                  │
+│  (Repositories, Database, Services) │
+└─────────────────────────────────────┘
+```
+
+### Layer Responsibilities
+
+<AccordionGroup>
+  <Accordion title="Presentation Layer">
+    - View Controllers extending `MUViewController`
+    - Custom UI components extending `MUView`
+    - User interaction handling
+    - Screen-specific logic
+    - Navigation flow management
+  </Accordion>
+
+  <Accordion title="Domain Layer">
+    - Business logic implementation
+    - Domain models (User, Operation, Transaction)
+    - Use cases via `AsyncAction<T>` pattern
+    - Cryptographic operations
+    - Domain services
+  </Accordion>
+
+  <Accordion title="Data Layer">
+    - Repository pattern for data access
+    - Database operations via GRDB
+    - Secure storage via Keychain
+    - Network services (Houston API)
+    - Local preferences (UserDefaults)
+  </Accordion>
+</AccordionGroup>
+
+## Project Structure
+
+The source code is organized in `~/workspace/source/falcon/app/falcon/`:
+
+```swift
+falcon/
+├── core/
+│   ├── Analytics/          // Analytics events and tracking
+│   ├── Data/              // Data layer implementation
+│   │   ├── Repository/    // Repository implementations
+│   │   ├── Database/      // GRDB database models
+│   │   ├── Service/       // Network services
+│   │   └── UserDefaults/  // Preferences storage
+│   ├── Domain/            // Domain layer
+│   │   ├── Action/        // Use cases (AsyncAction)
+│   │   ├── Model/         // Domain models
+│   │   └── Service/       // Domain services
+│   └── Extension/         // Swift extensions
+├── Presentation/          // UI layer
+│   ├── Screen/           // View Controllers
+│   ├── Component/        // Reusable UI components
+│   └── Models/           // View models
+└── Resource/             // Assets, strings, etc.
+```
+
+## Key Features
+
+### Reactive Data Flow
+
+The app uses RxSwift extensively for reactive data binding:
+
+```swift
+// Example: Watching user changes
+func watchUser() -> Observable<User?> {
+    return preferences.watchObject(key: .user)
+}
+
+// Example: Observing database changes
+func watchOperations() -> Observable<[Operation]> {
+    return OperationDB.all()
+        .rx
+        .observeAll(in: queue)
+        .map { objects in
+            try objects.map { try $0.to(using: db) }
+        }
+}
+```
+
+### Dependency Injection
+
+Dependencies are managed through `DependencyContainer` and injected into each layer.
+
+### Type-Safe Database Access
+
+GRDB provides compile-time safety for database operations:
+
+```swift
+try db.create(table: "operationDB") { t in
+    t.column("id", .integer).primaryKey()
+    t.column("direction", .text).notNull()
+    t.column("status", .text).notNull()
+    t.column("amountInSatoshis", .integer).notNull()
+}
+```
+
+## Security Features
+
+- **Keychain Storage**: Sensitive data stored in iOS Keychain
+- **Secure Enclave**: Hardware-backed key storage
+- **Biometric Authentication**: Face ID / Touch ID support
+- **PIN Protection**: Optional PIN for app access
+- **Encrypted Keys**: User keys encrypted at rest
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Architecture Layers" icon="layer-group" href="/ios/architecture-layers">
+    Deep dive into the three-layer architecture
+  </Card>
+  <Card title="Data Layer" icon="database" href="/ios/data/repositories">
+    Learn about repositories and data access
+  </Card>
+  <Card title="Domain Layer" icon="cube" href="/ios/domain/models">
+    Explore domain models and use cases
+  </Card>
+</CardGroup>

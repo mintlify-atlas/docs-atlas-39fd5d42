@@ -1,0 +1,570 @@
+---
+title: 'Emergency Kit Generation'
+description: 'Generate PDF emergency kits for wallet recovery'
+---
+
+## Overview
+
+Muun's Emergency Kit is a PDF document containing encrypted wallet keys and output descriptors for fund recovery. It enables users to recover their funds even if Muun servers are unavailable.
+
+## Emergency Kit Structure
+
+### Input Parameters
+
+```go
+type Input struct {
+    FirstEncryptedKey  string  // User's encrypted key
+    FirstFingerprint   string  // User key fingerprint
+    SecondEncryptedKey string  // Muun's encrypted key
+    SecondFingerprint  string  // Muun key fingerprint
+    Version            int     // Kit version
+}
+```
+
+### Output Structure
+
+```go
+type Output struct {
+    HTML             string  // Rendered HTML
+    VerificationCode string  // 6-digit code
+}
+```
+
+## Generation Process
+
+### Generate Emergency Kit HTML
+
+<CodeGroup>
+
+```go Go (libwallet/emergencykit/emergencykit.go:43)
+func GenerateHTML(
+    params *Input,
+    lang string,
+) (*Output, error) {
+    // Generate deterministic verification code
+    verificationCode := generateDeterministicCode(params)
+    
+    // Render output descriptors if fingerprints provided
+    var descriptors string
+    if params.hasFingerprints() {
+        descriptors = GetDescriptorsHTML(&DescriptorsData{
+            FirstFingerprint:  params.FirstFingerprint,
+            SecondFingerprint: params.SecondFingerprint,
+        })
+    }
+    
+    // Render page content
+    content, err := render("EmergencyKitContent", lang, &contentData{
+        FirstEncryptedKey:  params.FirstEncryptedKey,
+        SecondEncryptedKey: params.SecondEncryptedKey,
+        VerificationCode:   verificationCode,
+        CurrentDate:        formatDate(time.Now(), lang),
+        Descriptors:        descriptors,
+        IconHelp:           iconHelp,
+        IconPadlock:        iconPadlock,
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to render content: %w", err)
+    }
+    
+    // Render complete HTML page
+    page, err := render("EmergencyKitPage", lang, &pageData{
+        Css:     css,
+        Content: content,
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to render page: %w", err)
+    }
+    
+    return &Output{
+        HTML:             page,
+        VerificationCode: verificationCode,
+    }, nil
+}
+```
+
+```swift iOS
+let userKey: LibwalletHDPublicKey = // user's public key
+let muunKey: LibwalletHDPublicKey = // Muun's public key
+
+// Encrypt keys with recovery code
+let userEncrypted = try! encryptKey(userKey, with: recoveryCode)
+let muunEncrypted = try! encryptKey(muunKey, with: recoveryCode)
+
+// Get key fingerprints
+let userFingerprint = userKey.fingerprintHex()
+let muunFingerprint = muunKey.fingerprintHex()
+
+// Generate emergency kit
+let input = LibwalletEmergencyKitInput(
+    firstEncryptedKey: userEncrypted,
+    firstFingerprint: userFingerprint,
+    secondEncryptedKey: muunEncrypted,
+    secondFingerprint: muunFingerprint,
+    version: 2
+)
+
+let output = try! LibwalletGenerateEmergencyKitHTML(input, "en")
+
+print("Verification code: \(output.verificationCode)")
+print("HTML length: \(output.html.count) bytes")
+```
+
+</CodeGroup>
+
+## Verification Code
+
+### Deterministic Generation
+
+The verification code is derived from the encrypted keys:
+
+```go
+func generateDeterministicCode(params *Input) string {
+    // Use only second key (Muun key) for stability
+    // Note: This compensates for client bugs with first key serialization
+    inputMaterial := params.SecondEncryptedKey + strconv.Itoa(params.Version)
+    
+    // Compute SHA-256 hash
+    inputHash := sha256.Sum256([]byte(inputMaterial))
+    
+    // Extract 6-digit code from hash
+    var code string
+    for _, b := range inputHash[:6] {
+        code += strconv.Itoa(int(b) % 10)
+    }
+    
+    return code
+}
+```
+
+### iOS Implementation
+
+```swift
+import CryptoKit
+
+func generateVerificationCode(
+    encryptedKey: String,
+    version: Int
+) -> String {
+    let material = encryptedKey + String(version)
+    let hash = SHA256.hash(data: material.data(using: .utf8)!)
+    
+    var code = ""
+    for byte in hash.prefix(6) {
+        code += String(Int(byte) % 10)
+    }
+    
+    return code
+}
+
+let verificationCode = generateVerificationCode(
+    encryptedKey: muunEncrypted,
+    version: 2
+)
+
+print("Verification: \(verificationCode)")
+// Example: 382947
+```
+
+## Key Encryption
+
+### Encrypt HD Key
+
+Keys are encrypted with the recovery code:
+
+```swift
+func encryptKey(
+    _ publicKey: LibwalletHDPublicKey,
+    with recoveryCode: String
+) throws -> String {
+    // Serialize extended public key
+    let xpub = publicKey.string()
+    let xpubData = xpub.data(using: .utf8)!
+    
+    // Derive encryption key from recovery code
+    let challengeKey = try LibwalletRecoveryCodeToKey(
+        recoveryCode,
+        "muun"
+    )
+    
+    // Encrypt with challenge key
+    let encrypter = challengeKey.encrypter()
+    let encrypted = try encrypter.encrypt(xpubData)
+    
+    return encrypted
+}
+```
+
+## Output Descriptors
+
+### Descriptor Structure
+
+Descriptors define how to derive addresses:
+
+```html
+<descriptors>
+  <descriptor>
+    <title>External Addresses (Receiving)</title>
+    <path>wsh(sortedmulti(2,[{fingerprint1}/48'/0'/0'/2']xpub.../0/*,[{fingerprint2}/48'/0'/0'/2']xpub.../0/*))</path>
+  </descriptor>
+  <descriptor>
+    <title>Internal Addresses (Change)</title>
+    <path>wsh(sortedmulti(2,[{fingerprint1}/48'/0'/0'/2']xpub.../1/*,[{fingerprint2}/48'/0'/0'/2']xpub.../1/*))</path>
+  </descriptor>
+</descriptors>
+```
+
+### Generate Descriptors
+
+```go
+type DescriptorsData struct {
+    FirstFingerprint  string
+    SecondFingerprint string
+}
+
+func GetDescriptorsHTML(data *DescriptorsData) string {
+    // Render descriptor template
+    return renderDescriptors(data)
+}
+```
+
+## Date Formatting
+
+### Localized Dates
+
+```go
+var spanishMonthNames = []string{
+    "Enero", "Febrero", "Marzo", "Abril",
+    "Mayo", "Junio", "Julio", "Agosto",
+    "Septiembre", "Octubre", "Noviembre", "Diciembre",
+}
+
+func formatDate(t time.Time, lang string) string {
+    if lang == "en" {
+        return t.Format("January 2, 2006")
+    } else {
+        year, month, day := t.Date()
+        monthName := spanishMonthNames[month-1]
+        return fmt.Sprintf("%d de %s, %d", day, monthName, year)
+    }
+}
+```
+
+### iOS Date Formatting
+
+```swift
+extension Date {
+    func emergencyKitFormat(locale: Locale) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = locale
+        formatter.dateStyle = .long
+        return formatter.string(from: self)
+    }
+}
+
+let date = Date()
+let formatted = date.emergencyKitFormat(locale: Locale(identifier: "en_US"))
+print(formatted)  // "March 13, 2026"
+```
+
+## PDF Generation
+
+### Convert HTML to PDF
+
+```swift
+import WebKit
+
+class EmergencyKitPDFGenerator {
+    func generatePDF(html: String) async throws -> Data {
+        let webView = WKWebView()
+        
+        // Load HTML
+        webView.loadHTMLString(html, baseURL: nil)
+        
+        // Wait for load
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        
+        // Create PDF
+        let pdfConfiguration = WKPDFConfiguration()
+        pdfConfiguration.rect = CGRect(
+            x: 0, y: 0,
+            width: 8.5 * 72,  // Letter size
+            height: 11 * 72
+        )
+        
+        return try await webView.pdf(configuration: pdfConfiguration)
+    }
+}
+
+// Usage
+let generator = EmergencyKitPDFGenerator()
+let pdfData = try await generator.generatePDF(html: output.html)
+
+// Save to file
+let fileURL = FileManager.default.temporaryDirectory
+    .appendingPathComponent("emergency-kit.pdf")
+try pdfData.write(to: fileURL)
+```
+
+## Complete Generation Flow
+
+### iOS Implementation
+
+```swift
+class EmergencyKitManager {
+    func generateEmergencyKit(
+        recoveryCode: String,
+        userKey: LibwalletHDPublicKey,
+        muunKey: LibwalletHDPublicKey,
+        language: String = "en"
+    ) async throws -> (pdf: Data, verificationCode: String) {
+        // 1. Encrypt keys with recovery code
+        let userEncrypted = try encryptKey(userKey, with: recoveryCode)
+        let muunEncrypted = try encryptKey(muunKey, with: recoveryCode)
+        
+        // 2. Get key fingerprints
+        let userFingerprint = userKey.fingerprintHex()
+        let muunFingerprint = muunKey.fingerprintHex()
+        
+        // 3. Create input
+        let input = LibwalletEmergencyKitInput(
+            firstEncryptedKey: userEncrypted,
+            firstFingerprint: userFingerprint,
+            secondEncryptedKey: muunEncrypted,
+            secondFingerprint: muunFingerprint,
+            version: 2
+        )
+        
+        // 4. Generate HTML
+        let output = try LibwalletGenerateEmergencyKitHTML(input, language)
+        
+        // 5. Convert to PDF
+        let generator = EmergencyKitPDFGenerator()
+        let pdfData = try await generator.generatePDF(html: output.html)
+        
+        return (pdfData, output.verificationCode)
+    }
+    
+    func saveEmergencyKit(
+        _ pdfData: Data,
+        verificationCode: String
+    ) throws -> URL {
+        let filename = "muun-emergency-kit-\(verificationCode).pdf"
+        let documentsURL = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        )[0]
+        let fileURL = documentsURL.appendingPathComponent(filename)
+        
+        try pdfData.write(to: fileURL)
+        
+        return fileURL
+    }
+    
+    func shareEmergencyKit(_ fileURL: URL) -> UIActivityViewController {
+        let activityVC = UIActivityViewController(
+            activityItems: [fileURL],
+            applicationActivities: nil
+        )
+        
+        // Exclude some activities
+        activityVC.excludedActivityTypes = [
+            .addToReadingList,
+            .assignToContact,
+            .postToFacebook,
+            .postToTwitter
+        ]
+        
+        return activityVC
+    }
+}
+```
+
+## Security Considerations
+
+<AccordionGroup>
+  <Accordion title="Secure Key Handling">
+    Never log or display unencrypted keys:
+    ```swift
+    // ❌ WRONG - exposes private keys
+    print("Private key: \(privateKey.string())")
+    
+    // ✅ CORRECT - only use encrypted
+    let encrypted = try encryptKey(publicKey, with: recoveryCode)
+    print("Encrypted key: \(encrypted.prefix(20))...")
+    ```
+  </Accordion>
+  
+  <Accordion title="Verification Code Storage">
+    Store verification code separately:
+    ```swift
+    struct EmergencyKitMetadata: Codable {
+        let generatedDate: Date
+        let verificationCode: String
+        let version: Int
+    }
+    
+    func saveMetadata(
+        _ verificationCode: String,
+        version: Int
+    ) throws {
+        let metadata = EmergencyKitMetadata(
+            generatedDate: Date(),
+            verificationCode: verificationCode,
+            version: version
+        )
+        
+        let data = try JSONEncoder().encode(metadata)
+        try KeychainWrapper.standard.set(
+            data,
+            forKey: "emergency_kit_metadata"
+        )
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="PDF Security">
+    Consider password-protecting the PDF:
+    ```swift
+    func protectPDF(
+        _ pdfData: Data,
+        password: String
+    ) throws -> Data {
+        let pdfDocument = PDFDocument(data: pdfData)!
+        
+        let options: [PDFDocumentWriteOption: Any] = [
+            .userPasswordOption: password,
+            .ownerPasswordOption: password
+        ]
+        
+        return pdfDocument.dataRepresentation(options: options)!
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Clean Up Temporary Files">
+    Delete temporary files after use:
+    ```swift
+    defer {
+        try? FileManager.default.removeItem(at: tempFileURL)
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Validate Inputs">
+    Validate all parameters before generation:
+    ```swift
+    func validateEmergencyKitParams(
+        recoveryCode: String,
+        userKey: LibwalletHDPublicKey?,
+        muunKey: LibwalletHDPublicKey?
+    ) throws {
+        guard !recoveryCode.isEmpty else {
+            throw EmergencyKitError.missingRecoveryCode
+        }
+        
+        try LibwalletValidateRecoveryCode(recoveryCode)
+        
+        guard userKey != nil && muunKey != nil else {
+            throw EmergencyKitError.missingKeys
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Version Emergency Kits">
+    Include version number for future compatibility:
+    ```swift
+    enum EmergencyKitVersion: Int {
+        case v1 = 1
+        case v2 = 2  // Current
+        
+        var supportedAddressVersions: [Int] {
+            switch self {
+            case .v1:
+                return [1, 2, 3, 4]
+            case .v2:
+                return [1, 2, 3, 4, 5, 6]
+            }
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Test Kit Recovery">
+    Always test emergency kit recovery:
+    ```swift
+    func testEmergencyKitRecovery(
+        _ pdfData: Data,
+        recoveryCode: String
+    ) async throws -> Bool {
+        // Extract encrypted keys from PDF
+        let keys = try extractKeysFromPDF(pdfData)
+        
+        // Attempt decryption
+        let userKey = try decryptKey(
+            keys.firstEncryptedKey,
+            with: recoveryCode
+        )
+        let muunKey = try decryptKey(
+            keys.secondEncryptedKey,
+            with: recoveryCode
+        )
+        
+        // Verify keys match originals
+        return userKey != nil && muunKey != nil
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Error Handling
+
+```swift
+enum EmergencyKitError: Error {
+    case missingRecoveryCode
+    case missingKeys
+    case encryptionFailed
+    case htmlGenerationFailed
+    case pdfGenerationFailed
+    case invalidVersion
+    
+    var localizedDescription: String {
+        switch self {
+        case .missingRecoveryCode:
+            return "Recovery code is required"
+        case .missingKeys:
+            return "Both user and Muun keys are required"
+        case .encryptionFailed:
+            return "Failed to encrypt keys"
+        case .htmlGenerationFailed:
+            return "Failed to generate HTML"
+        case .pdfGenerationFailed:
+            return "Failed to generate PDF"
+        case .invalidVersion:
+            return "Unsupported emergency kit version"
+        }
+    }
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Emergency Kit Recovery" icon="life-ring" href="/libwallet/emergency-kit/recovery">
+    Recover wallet from emergency kit
+  </Card>
+  <Card title="Key Management" icon="key" href="/libwallet/crypto/keys">
+    Understand HD key derivation
+  </Card>
+  <Card title="Encryption" icon="lock" href="/libwallet/crypto/encryption">
+    Learn about key encryption
+  </Card>
+  <Card title="Recovery Codes" icon="shield" href="/libwallet/getting-started">
+    Generate and validate recovery codes
+  </Card>
+</CardGroup>

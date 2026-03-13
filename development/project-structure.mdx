@@ -1,0 +1,340 @@
+---
+title: Project Structure
+description: Understand the architecture and organization of the Muun Wallet iOS codebase
+---
+
+The Muun Wallet iOS app follows a three-layer clean architecture pattern that separates concerns and improves testability.
+
+## Repository Overview
+
+The repository is organized into several top-level directories:
+
+```bash
+.
+├── falcon/           # iOS app
+│   └── app/         # Main application code
+├── libwallet/       # Crypto and Bitcoin logic (Go)
+├── prover/          # Zero-knowledge proof components
+└── tools/           # Build and development scripts
+```
+
+## Three-Layer Architecture
+
+The app follows clean architecture principles with three distinct layers:
+
+<Steps>
+  <Step title="Data Layer">
+    Handles all data backends including database, operating system APIs, and network communication.
+    
+    **Location:** `falcon/app/falcon/core/Data/`
+    
+    ```bash
+    Data/
+    ├── AFS/                    # App-provided data providers
+    ├── Component/              # Reusable data components
+    ├── Database/               # SQLite database models
+    │   ├── Operation/         # Transaction database models
+    │   └── PublicProfile/     # User profile database models
+    ├── Errors/                 # Data layer errors
+    ├── Libwallet/             # Go libwallet bridge
+    ├── Notification/          # Push notification handlers
+    ├── Repository/            # Data access layer
+    ├── Scheduler/             # Background task scheduling
+    ├── Service/               # Network services
+    │   ├── Base/             # Base service classes
+    │   ├── DTO/              # Data transfer objects
+    │   ├── Houston/          # Muun backend API
+    │   └── RealTimeFees/     # Fee estimation service
+    └── UserDefaults/          # Local preferences
+    ```
+  </Step>
+
+  <Step title="Domain Layer">
+    Contains business logic, models, and use cases (actions).
+    
+    **Location:** `falcon/app/falcon/core/Domain/`
+    
+    ```bash
+    Domain/
+    ├── Action/                 # Use cases (business logic)
+    │   ├── Address/           # Address generation actions
+    │   ├── ApiMigration/      # API migration actions
+    │   ├── Base/              # Base action classes
+    │   ├── IncomingSwap/      # Lightning receive actions
+    │   ├── LNURL/             # LNURL protocol actions
+    │   ├── Nfc/               # NFC card operations
+    │   ├── Operations/        # Transaction actions
+    │   ├── RealTime/          # Real-time data sync
+    │   ├── Session/           # Authentication actions
+    │   └── UserPreferences/   # User settings actions
+    ├── Crypto/                # Cryptographic utilities
+    │   └── hd/               # HD wallet utilities
+    ├── Model/                 # Domain models
+    │   ├── AuthAndSessions/  # Authentication models
+    │   ├── Contacts/         # Contact models
+    │   ├── Crypto/           # Cryptographic models
+    │   ├── IncomingSwap/     # Submarine swap models
+    │   ├── Operations/       # Transaction models
+    │   └── Transaction/      # Transaction details
+    ├── Notifications/         # Notification handling
+    ├── Selector/              # Data selectors (queries)
+    ├── Service/               # Domain services
+    ├── Sync/                  # Data synchronization
+    └── Utils/                 # Domain utilities
+    ```
+  </Step>
+
+  <Step title="Presentation Layer">
+    Contains all UI code including view controllers, presenters, and views.
+    
+    **Location:** `falcon/app/falcon/Presentation/`
+    
+    ```bash
+    Presentation/
+    ├── Actions/               # UI action handlers
+    ├── Component/             # Reusable UI components
+    ├── Launch/                # App launch flow
+    ├── Models/                # Presentation models
+    ├── PageObject/            # UI testing page objects
+    ├── Screen/                # View controllers & presenters
+    │   ├── ApiMigrations/
+    │   ├── Base/
+    │   ├── Debug/
+    │   └── ...
+    └── Services/              # Presentation services
+    ```
+  </Step>
+</Steps>
+
+## Libwallet Module
+
+The libwallet module contains all cryptocurrency and Bitcoin-specific code:
+
+**Location:** `libwallet/`
+
+```bash
+libwallet/
+├── addresses/             # Address generation
+├── btcsuitew/            # Bitcoin library wrapper
+├── cryptography/         # Crypto primitives
+├── domain/               # Core domain logic
+├── emergencykit/         # Recovery kit generation
+├── fees/                 # Fee calculation
+├── hdpath/               # BIP32 HD paths
+├── librs/                # Rust components
+│   ├── makelibs.sh      # Build script
+│   └── libs.Dockerfile  # Docker build config
+├── musig/                # MuSig multi-sig
+├── musig2v040/           # MuSig2 implementation
+├── operation/            # Transaction operations
+└── swaps/                # Submarine swaps
+```
+
+<Note>
+  Libwallet is written in **Go** and bridged to Swift using [gomobile](https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile). The `librs` subdirectory contains **Rust** code for zero-knowledge proofs.
+</Note>
+
+## Key Files
+
+### Configuration Files
+
+<CodeGroup>
+  ```ruby Podfile
+  # Dependency management
+  source 'https://cdn.cocoapods.org/'
+  
+  platform :ios, '15.0'
+  
+  target 'Muun' do
+    use_frameworks! :linkage => :static
+    
+    pod 'Firebase/Core'
+    pod 'Firebase/Messaging'
+    pod 'GRDB.swift', '4.14.0'
+    pod 'RxSwift', '5.0.1'
+    # ...
+  end
+  ```
+
+  ```yaml swiftgen.yml
+  # Code generation for assets
+  strings:
+    inputs:
+      - falcon/Resource/Localization/en.lproj
+    outputs:
+      - templateName: structured-swift5
+        output: falcon/Resource/Localization/Strings+Generated.swift
+        
+  xcassets:
+    inputs:
+      - falcon/Resource/Assets.xcassets
+      - falcon/Resource/Colors.xcassets
+    outputs:
+      - templateName: swift5
+        output: falcon/Resource/XCAssets+Generated.swift
+  ```
+
+  ```yaml .swiftlint.yml
+  # Linting configuration
+  disabled_rules:
+    - identifier_name
+    - void_return
+    
+  excluded:
+    - Pods
+    - falconTests
+    - falconUITests
+    
+  line_length: 100
+  swiftlint_version: 0.50.1
+  ```
+</CodeGroup>
+
+### Build Scripts
+
+<CodeGroup>
+  ```bash tools/libwallet-ios.sh
+  # Builds the Go libwallet framework for iOS
+  # - Checks for source changes using shasum
+  # - Runs gomobile bind for iOS and simulator
+  # - Creates Libwallet.xcframework
+  
+  CGO_LDFLAGS="-lresolv" \
+    go run golang.org/x/mobile/cmd/gomobile bind \
+    -target=ios,iossimulator -o "$libwallet" \
+    -iosversion="15.0" \
+    . ./newop ./app_provided_data ./libwallet_init
+  ```
+
+  ```bash tools/bootstrap-gomobile.sh
+  # Installs gomobile and gobind
+  
+  GOMODCACHE="$build_dir/pkg" \
+    go install golang.org/x/mobile/cmd/gomobile && \
+    go install golang.org/x/mobile/cmd/gobind
+  ```
+
+  ```bash libwallet/librs/makelibs.sh
+  # Builds Rust components for iOS
+  # - Creates Docker container with Rust toolchains
+  # - Builds for aarch64-apple-ios (device)
+  # - Builds for x86_64 & aarch64 simulators
+  # - Creates librs.xcframework
+  
+  xcodebuild -create-xcframework \
+    -library libs/aarch64-apple-ios-librs.a \
+    -headers librs.h \
+    -library libs/multi-apple-ios-sim-librs.a \
+    -headers librs.h \
+    -output libs/librs.xcframework
+  ```
+</CodeGroup>
+
+## Dependency Injection
+
+The app uses [Dip](https://github.com/AliSoftware/Dip) for dependency injection. Dependencies are resolved using the `resolve()` function:
+
+```swift falcon/core/Domain/Action/Address/AddressActions.swift
+public class AddressActions {
+    private let houstonService: HoustonService
+    private let keysRepository: KeysRepository
+    private let syncExternalAddresses: SyncExternalAddresses
+
+    init(houstonService: HoustonService,
+         keysRepository: KeysRepository,
+         syncExternalAddresses: SyncExternalAddresses) {
+        self.houstonService = houstonService
+        self.keysRepository = keysRepository
+        self.syncExternalAddresses = syncExternalAddresses
+    }
+    // ...
+}
+```
+
+## Presenter Pattern
+
+View controllers use the MVP pattern with presenters handling business logic:
+
+```swift falcon/Presentation/Screen/Base/BasePresenter.swift
+protocol BasePresenterDelegate: AnyObject {
+    func showMessage(_ message: String)
+    func pushTo(_ vc: MUViewController)
+    func present(_ viewControllerToPresent: UIViewController, animated flag: Bool, completion: (() -> Void)?)
+}
+
+class BasePresenter<Delegate> where Delegate: BasePresenterDelegate {
+    weak var delegate: Delegate!
+    var compositeDisposable: CompositeDisposable?
+    private var sessionActions: SessionActions = resolve()
+    
+    init(delegate: Delegate) {
+        self.delegate = delegate
+        compositeDisposable = CompositeDisposable()
+    }
+}
+```
+
+## Data Persistence
+
+The app uses **GRDB** for SQLite database access with **RxGRDB** for reactive queries:
+
+```swift falcon/core/Data/Repository/OperationRepository.swift
+class OperationRepository: BaseDatabaseRepository<OperationDB, Operation> {
+    private let publicProfileRepository: PublicProfileRepository
+    private let submarineSwapRepository: SubmarineSwapRepository
+    private let incomingSwapRepository: IncomingSwapRepository
+
+    init(queue: DatabaseQueue,
+         publicProfileRepository: PublicProfileRepository,
+         submarineSwapRepository: SubmarineSwapRepository,
+         incomingSwapRepository: IncomingSwapRepository) {
+        self.publicProfileRepository = publicProfileRepository
+        self.submarineSwapRepository = submarineSwapRepository
+        self.incomingSwapRepository = incomingSwapRepository
+        super.init(queue: queue)
+    }
+}
+```
+
+## Resources
+
+Assets and localization are stored in:
+
+```bash
+falcon/Resource/
+├── Assets.xcassets/      # Images and icons
+├── Colors.xcassets/      # Color definitions
+├── Constant/             # Constants
+├── Localization/         # Translations
+│   └── en.lproj/
+└── Lottie/              # Animations
+```
+
+SwiftGen generates type-safe accessors:
+
+```swift
+// Auto-generated code
+let color = Asset.Colors.muunBlue.color
+let image = Asset.Images.logo.image
+let text = L10n.welcomeMessage
+```
+
+## Testing Structure
+
+```bash
+falconTests/
+├── Domain/               # Business logic tests
+│   └── Action/
+├── DTO/                  # Data transfer object tests
+├── Extension/            # Extension tests
+├── Factories/            # Test data factories
+├── Mocking/              # Mock objects
+├── Presentation/         # UI logic tests
+└── Repositories/         # Data access tests
+```
+
+## Next Steps
+
+- Learn how to [build the project](/development/building)
+- Understand the [testing approach](/development/testing)
+- Explore the libwallet crypto implementation

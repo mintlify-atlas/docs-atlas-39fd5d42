@@ -1,0 +1,651 @@
+---
+title: 'MuSig2 Cryptography'
+description: 'Deep dive into MuSig2 multi-signature implementation'
+---
+
+## Overview
+
+MuSig2 is a multi-signature scheme for Schnorr signatures that enables multiple parties to create a single aggregate signature. Muun implements two versions: v0.4.0 (custom) and v1.0.0 (BIP 327).
+
+## MuSig2 Versions
+
+### Version Comparison
+
+<Tabs>
+  <Tab title="v0.4.0 (Muun)">
+    - Based on secp256k1_zkp commit 0aeaa5d
+    - Fixed key ordering: [user, muun]
+    - x-only public keys
+    - Deterministic nonces from sessionId only
+    - Used for V5 addresses
+  </Tab>
+  
+  <Tab title="v1.0.0 (BIP 327)">
+    - Standard BIP 327 implementation
+    - Sorted key ordering
+    - Compressed public keys
+    - Nonces include public key
+    - Used for V6 addresses
+  </Tab>
+</Tabs>
+
+## Key Aggregation
+
+### Aggregation Coefficient
+
+Each signer gets a coefficient based on their position:
+
+```go
+func aggregationCoefficient(
+    keySet []*btcec.PublicKey,
+    targetKey *btcec.PublicKey,
+    keysHash []byte,
+    secondKeyIdx int,
+) *btcec.ModNScalar {
+    var mu btcec.ModNScalar
+    
+    // If this is the second key, coefficient is 1
+    if secondKeyIdx != -1 && keyBytesEqual(keySet[secondKeyIdx], targetKey) {
+        return mu.SetInt(1)
+    }
+    
+    // Otherwise compute: H(tag=KeyAgg coefficient, keysHash || targetKey)
+    var coefficientBytes [64]byte
+    copy(coefficientBytes[:], keysHash[:])
+    copy(coefficientBytes[32:], schnorr.SerializePubKey(targetKey))
+    
+    muHash := chainhash.TaggedHash(KeyAggTagCoeff, coefficientBytes[:])
+    mu.SetByteSlice(muHash[:])
+    
+    return &mu
+}
+```
+
+### Key Fingerprint Hash
+
+```go
+func keyHashFingerprint(keys []*btcec.PublicKey, sort bool) []byte {
+    if sort {
+        keys = sortKeys(keys)
+    }
+    
+    // Create buffer for all key bytes
+    keyAggBuf := make([]byte, 32*len(keys))
+    keyBytes := bytes.NewBuffer(keyAggBuf[0:0])
+    for _, key := range keys {
+        keyBytes.Write(schnorr.SerializePubKey(key))
+    }
+    
+    // H(tag=KeyAgg list, pk1 || pk2 || ...)
+    h := chainhash.TaggedHash(KeyAggTagList, keyBytes.Bytes())
+    return h[:]
+}
+```
+
+### Aggregate Keys with Tweaks
+
+<CodeGroup>
+
+```go Go (libwallet/musig2v040/keys.go:343)
+func AggregateKeys(
+    keys []*btcec.PublicKey,
+    sort bool,
+    keyOpts ...KeyAggOption,
+) (*AggregateKey, *btcec.ModNScalar, *btcec.ModNScalar, error) {
+    opts := defaultKeyAggOptions()
+    for _, option := range keyOpts {
+        option(opts)
+    }
+    
+    if sort {
+        keys = sortKeys(keys)
+    }
+    
+    // Compute key hash if not provided
+    if opts.keyHash == nil {
+        opts.keyHash = keyHashFingerprint(keys, sort)
+    }
+    
+    // Find second unique key index
+    if opts.uniqueKeyIndex == nil {
+        idx := secondUniqueKeyIndex(keys, sort)
+        opts.uniqueKeyIndex = &idx
+    }
+    
+    // Aggregate: P = sum(a_i * P_i)
+    var finalKeyJ btcec.JacobianPoint
+    for _, key := range keys {
+        var keyJ btcec.JacobianPoint
+        key.AsJacobian(&keyJ)
+        
+        // Compute coefficient and multiply
+        a := aggregationCoefficient(
+            keys, key, opts.keyHash, *opts.uniqueKeyIndex,
+        )
+        var tweakedKeyJ btcec.JacobianPoint
+        btcec.ScalarMultNonConst(a, &keyJ, &tweakedKeyJ)
+        
+        // Accumulate
+        btcec.AddNonConst(&finalKeyJ, &tweakedKeyJ, &finalKeyJ)
+    }
+    
+    finalKeyJ.ToAffine()
+    combinedKey := btcec.NewPublicKey(&finalKeyJ.X, &finalKeyJ.Y)
+    
+    // Apply tweaks if specified
+    var (
+        err       error
+        tweakAcc  btcec.ModNScalar
+        parityAcc btcec.ModNScalar
+    )
+    parityAcc.SetInt(1)
+    
+    for i := 1; i <= len(opts.tweaks); i++ {
+        finalKeyJ, parityAcc, tweakAcc, err = tweakKey(
+            finalKeyJ, parityAcc, opts.tweaks[i-1].Tweak, tweakAcc,
+            opts.tweaks[i-1].IsXOnly,
+        )
+        if err != nil {
+            return nil, nil, nil, err
+        }
+    }
+    
+    finalKeyJ.ToAffine()
+    finalKey := btcec.NewPublicKey(&finalKeyJ.X, &finalKeyJ.Y)
+    
+    return &AggregateKey{
+        PreTweakedKey: combinedKey,
+        FinalKey:      finalKey,
+    }, &parityAcc, &tweakAcc, nil
+}
+```
+
+```swift iOS
+let userPubKey = userPrivKey.publicKey().key.serializeCompressed()
+let muunPubKey = muunKey.key.serializeCompressed()
+
+let pubKeys = [userPubKey, muunPubKey]
+let tweak = LibwalletKeySpendOnlyTweak()
+
+let aggregated = try! LibwalletMusig2CombinePubKeysWithTweak(
+    LibwalletMusig2v100,
+    pubKeys,
+    tweak
+)
+
+print("Aggregated key: \(aggregated.finalKey.serializeCompressed().hexString)")
+print("Pre-tweaked key: \(aggregated.preTweakedKey.serializeCompressed().hexString)")
+```
+
+</CodeGroup>
+
+## Tweaking
+
+### Tweak Types
+
+```go
+type KeyTweakDesc struct {
+    Tweak   [32]byte
+    IsXOnly bool  // Convert to x-only before tweaking
+}
+```
+
+### BIP 86 Tweak (Key-Spend Only)
+
+```go
+func WithBIP86KeyTweak() KeyAggOption {
+    return func(o *keyAggOption) {
+        o.tweaks = []KeyTweakDesc{
+            {
+                IsXOnly: true,
+            },
+        }
+        o.taprootTweak = true
+        o.bip86Tweak = true
+    }
+}
+```
+
+### Taproot Tweak with Script Root
+
+```go
+func WithTaprootKeyTweak(scriptRoot []byte) KeyAggOption {
+    return func(o *keyAggOption) {
+        var tweak [32]byte
+        copy(tweak[:], scriptRoot[:])
+        
+        o.tweaks = []KeyTweakDesc{
+            {
+                Tweak:   tweak,
+                IsXOnly: true,
+            },
+        }
+        o.taprootTweak = true
+    }
+}
+```
+
+### Apply Tweak to Key
+
+```go
+func tweakKey(
+    keyJ btcec.JacobianPoint,
+    parityAcc btcec.ModNScalar,
+    tweak [32]byte,
+    tweakAcc btcec.ModNScalar,
+    xOnly bool,
+) (btcec.JacobianPoint, btcec.ModNScalar, btcec.ModNScalar, error) {
+    // Compute parity factor
+    var parityFactor btcec.ModNScalar
+    if xOnly && !hasEvenY(keyJ) {
+        parityFactor.SetInt(1).Negate()
+    } else {
+        parityFactor.SetInt(1)
+    }
+    
+    // Map tweak to scalar
+    tweakInt := new(btcec.ModNScalar)
+    overflows := tweakInt.SetBytes(&tweak)
+    if overflows == 1 {
+        return keyJ, parityAcc, tweakAcc, ErrTweakedKeyOverflows
+    }
+    
+    // Compute: Q_i = g*Q + t*G
+    // where g is parity factor and t is tweak
+    var tweakedGenerator btcec.JacobianPoint
+    btcec.ScalarBaseMultNonConst(tweakInt, &tweakedGenerator)
+    
+    btcec.ScalarMultNonConst(&parityFactor, &keyJ, &keyJ)
+    btcec.AddNonConst(&tweakedGenerator, &keyJ, &keyJ)
+    
+    if keyJ == infinityPoint {
+        return keyJ, parityAcc, tweakAcc, ErrTweakedKeyIsInfinity
+    }
+    
+    // Accumulate parity and tweak
+    parityAcc.Mul(&parityFactor)
+    tweakAcc.Mul(&parityFactor).Add(tweakInt)
+    
+    return keyJ, parityAcc, tweakAcc, nil
+}
+```
+
+## Nonce Generation
+
+### MuSig2 v0.4.0 Nonces
+
+```go
+func GenNonces(
+    opts ...NonceGenOption,
+) (*musig2v100.Nonces, error) {
+    cfg := defaultNonceGenCfg()
+    for _, opt := range opts {
+        opt(cfg)
+    }
+    
+    // Generate two secret nonces
+    var secNonce [SecNonceSize]byte
+    var k1, k2 btcec.ModNScalar
+    
+    // Read random bytes for k1
+    _, err := io.ReadFull(cfg.randReader, secNonce[:btcec.PrivKeyBytesLen])
+    if err != nil {
+        return nil, err
+    }
+    k1.SetByteSlice(secNonce[:btcec.PrivKeyBytesLen])
+    
+    // Read random bytes for k2
+    _, err = io.ReadFull(cfg.randReader, secNonce[btcec.PrivKeyBytesLen:])
+    if err != nil {
+        return nil, err
+    }
+    k2.SetByteSlice(secNonce[btcec.PrivKeyBytesLen:])
+    
+    // Compute public nonces: R1 = k1*G, R2 = k2*G
+    var r1J, r2J btcec.JacobianPoint
+    btcec.ScalarBaseMultNonConst(&k1, &r1J)
+    btcec.ScalarBaseMultNonConst(&k2, &r2J)
+    
+    r1J.ToAffine()
+    r2J.ToAffine()
+    
+    return &musig2v100.Nonces{
+        PubNonce: [PubNonceSize]byte{...},
+        SecNonce: secNonce,
+    }, nil
+}
+```
+
+### MuSig2 v1.0.0 Nonces
+
+v1.0.0 includes the public key in nonce generation:
+
+```go
+func GenNonces(
+    opts ...musig2v100.NonceGenOption,
+) (*musig2v100.Nonces, error) {
+    // Requires WithPublicKey option
+    return musig2v100.GenNonces(opts...)
+}
+```
+
+## Signing
+
+### Sign Message
+
+<CodeGroup>
+
+```go Go (libwallet/musig2v040/sign.go:190)
+func Sign(
+    secNonce [SecNonceSize]byte,
+    privKey *btcec.PrivateKey,
+    combinedNonce [PubNonceSize]byte,
+    pubKeys []*btcec.PublicKey,
+    msg [32]byte,
+    signOpts ...SignOption,
+) (*PartialSignature, error) {
+    opts := defaultSignOptions()
+    for _, option := range signOpts {
+        option(opts)
+    }
+    
+    // Aggregate keys
+    combinedKey, parityAcc, _, err := AggregateKeys(
+        pubKeys, opts.sortKeys, keyAggOpts...,
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    // Compute nonce blinder: b = H(combinedNonce || combinedKey || m)
+    var nonceBlinder btcec.ModNScalar
+    nonceMsgBuf := sha256.New()
+    nonceMsgBuf.Write(combinedNonce[:])
+    nonceMsgBuf.Write(schnorr.SerializePubKey(combinedKey.FinalKey))
+    nonceMsgBuf.Write(msg[:])
+    nonceBlindHash := nonceMsgBuf.Sum(nil)
+    nonceBlinder.SetByteSlice(nonceBlindHash[:])
+    
+    // Parse secret nonces
+    var k1, k2 btcec.ModNScalar
+    k1.SetByteSlice(secNonce[:btcec.PrivKeyBytesLen])
+    k2.SetByteSlice(secNonce[btcec.PrivKeyBytesLen:])
+    
+    if k1.IsZero() || k2.IsZero() {
+        return nil, ErrSecretNonceZero
+    }
+    
+    // Combine nonces: R = R_1 + b*R_2
+    r1J, _ := btcec.ParseJacobian(
+        combinedNonce[:btcec.PubKeyBytesLenCompressed],
+    )
+    r2J, _ := btcec.ParseJacobian(
+        combinedNonce[btcec.PubKeyBytesLenCompressed:],
+    )
+    
+    var nonce btcec.JacobianPoint
+    btcec.ScalarMultNonConst(&nonceBlinder, &r2J, &r2J)
+    btcec.AddNonConst(&r1J, &r2J, &nonce)
+    
+    nonce.ToAffine()
+    nonceKey := btcec.NewPublicKey(&nonce.X, &nonce.Y)
+    
+    // Negate nonces if R has odd y
+    if nonce.Y.IsOdd() {
+        k1.Negate()
+        k2.Negate()
+    }
+    
+    // Compute challenge: e = H(R || Q || m)
+    var challengeMsg bytes.Buffer
+    challengeMsg.Write(schnorr.SerializePubKey(nonceKey))
+    challengeMsg.Write(schnorr.SerializePubKey(combinedKey.FinalKey))
+    challengeMsg.Write(msg[:])
+    challengeBytes := chainhash.TaggedHash(
+        ChallengeHashTag, challengeMsg.Bytes(),
+    )
+    var e btcec.ModNScalar
+    e.SetByteSlice(challengeBytes[:])
+    
+    // Compute aggregation coefficient
+    pubKey := privKey.PubKey()
+    a := aggregationCoefficient(
+        pubKeys, pubKey, keysHash, uniqueKeyIndex,
+    )
+    
+    // Apply parity factors
+    privKeyScalar := privKey.Key
+    privKeyScalar.Mul(parityCombinedKey).Mul(paritySignKey).Mul(parityAcc)
+    
+    // Generate partial signature: s = k1 + b*k2 + e*a*d
+    s := new(btcec.ModNScalar)
+    s.Add(&k1).Add(k2.Mul(&nonceBlinder)).Add(e.Mul(a).Mul(&privKeyScalar))
+    
+    return &PartialSignature{
+        S: s,
+        R: nonceKey,
+    }, nil
+}
+```
+
+```swift iOS
+// Signing is handled internally by PST.sign()
+let pst: LibwalletPartiallySignedTransaction = // transaction
+let userPrivKey: LibwalletHDPrivateKey = // user's key
+let muunPubKey: LibwalletHDPublicKey = // server's key
+
+let signedTx = try! pst.sign(userPrivKey, muunPubKey)
+print("Signed TX: \(signedTx.hash)")
+```
+
+</CodeGroup>
+
+## Partial Signature Verification
+
+### Verify Partial Signature
+
+```go
+func (p *PartialSignature) Verify(
+    pubNonce [PubNonceSize]byte,
+    combinedNonce [PubNonceSize]byte,
+    keySet []*btcec.PublicKey,
+    signingKey *btcec.PublicKey,
+    msg [32]byte,
+    signOpts ...SignOption,
+) bool {
+    return verifyPartialSig(
+        p,
+        pubNonce,
+        combinedNonce,
+        keySet,
+        schnorr.SerializePubKey(signingKey),
+        msg,
+        signOpts...,
+    ) == nil
+}
+```
+
+### Verification Equation
+
+Verifies: **s·G == R' + e·a·P**
+
+Where:
+- **s** = partial signature scalar
+- **G** = generator point
+- **R'** = signer's combined nonce
+- **e** = challenge hash
+- **a** = aggregation coefficient
+- **P** = signer's public key
+
+## Signature Combination
+
+### Combine Partial Signatures
+
+```go
+func CombineSigs(
+    combinedNonce *btcec.PublicKey,
+    partialSigs []*PartialSignature,
+    combineOpts ...CombineOption,
+) *schnorr.Signature {
+    opts := defaultCombineOptions()
+    for _, option := range combineOpts {
+        option(opts)
+    }
+    
+    // Sum all partial signatures
+    var combinedSig btcec.ModNScalar
+    for _, partialSig := range partialSigs {
+        combinedSig.Add(partialSig.S)
+    }
+    
+    // Add tweak factor if needed
+    if tweakProduct != nil {
+        combinedSig.Add(tweakProduct)
+    }
+    
+    // Extract x coordinate of nonce
+    var nonceJ btcec.JacobianPoint
+    combinedNonce.AsJacobian(&nonceJ)
+    nonceJ.ToAffine()
+    
+    return schnorr.NewSignature(&nonceJ.X, &combinedSig)
+}
+```
+
+## Security Properties
+
+<AccordionGroup>
+  <Accordion title="Unforgeability">
+    MuSig2 provides the same security as single-key Schnorr signatures:
+    - Cannot forge signatures without private keys
+    - Challenge hash binds signature to message
+    - Nonces must be fresh and unpredictable
+  </Accordion>
+  
+  <Accordion title="Key Aggregation Security">
+    Aggregation coefficients prevent rogue key attacks:
+    ```go
+    // Each key is multiplied by unique coefficient
+    a_i = H(keysHash || P_i)
+    
+    // Prevents attacker from choosing P_attack = P_target - P_attacker
+    // because they don't know a_target in advance
+    ```
+  </Accordion>
+  
+  <Accordion title="Nonce Uniqueness">
+    Critical: Never reuse nonces with the same key:
+    ```swift
+    // ✅ CORRECT - unique nonce per signature
+    for input in inputs {
+        let sessionId = Data.random(count: 32)
+        nonces.add(sessionId)
+    }
+    
+    // ❌ WRONG - reusing nonce leaks private key!
+    let sessionId = Data.random(count: 32)
+    for _ in inputs {
+        nonces.add(sessionId) // DANGER!
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Parity Handling">
+    BIP 340 requires y-coordinate to be even:
+    ```go
+    // If nonce R has odd y, negate secret nonces
+    if nonce.Y.IsOdd() {
+        k1.Negate()
+        k2.Negate()
+    }
+    
+    // If combined key Q has odd y, negate private key
+    if combinedKeyYIsOdd {
+        privKey.Negate()
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Tagged Hashes
+
+MuSig2 uses tagged hashes for domain separation:
+
+```go
+var (
+    KeyAggTagList  = []byte("KeyAgg list")
+    KeyAggTagCoeff = []byte("KeyAgg coefficient")
+    ChallengeHashTag = []byte("BIP0340/challenge")
+)
+
+func TaggedHash(tag []byte, data []byte) []byte {
+    tagHash := sha256.Sum256(tag)
+    h := sha256.New()
+    h.Write(tagHash[:])
+    h.Write(tagHash[:])
+    h.Write(data)
+    return h.Sum(nil)
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Version Consistency">
+    Use consistent MuSig version for address scheme:
+    ```swift
+    let musigVersion: LibwalletMusigVersion
+    switch addressVersion {
+    case .v5:
+        musigVersion = LibwalletMusig2v040Muun
+    case .v6:
+        musigVersion = LibwalletMusig2v100
+    default:
+        throw MuSigError.unsupportedVersion
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Validate All Inputs">
+    Validate keys, nonces, and signatures:
+    ```swift
+    func validateMuSigInputs(
+        pubKeys: [[UInt8]],
+        nonces: [[UInt8]]
+    ) throws {
+        guard pubKeys.count >= 2 else {
+            throw MuSigError.insufficientKeys
+        }
+        
+        for pubKey in pubKeys {
+            guard pubKey.count == 33 else {
+                throw MuSigError.invalidKeySize
+            }
+        }
+        
+        for nonce in nonces {
+            guard nonce.count == 66 else {
+                throw MuSigError.invalidNonceSize
+            }
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Transaction Signing" icon="signature" href="/libwallet/signing">
+    Apply MuSig2 to sign transactions
+  </Card>
+  <Card title="Address Generation" icon="location-dot" href="/libwallet/addresses">
+    Create Taproot addresses with MuSig
+  </Card>
+  <Card title="Key Management" icon="key" href="/libwallet/crypto/keys">
+    Manage HD keys for MuSig
+  </Card>
+  <Card title="Submarine Swaps" icon="arrows-rotate" href="/libwallet/lightning/swaps">
+    Use MuSig in swap scripts
+  </Card>
+</CardGroup>

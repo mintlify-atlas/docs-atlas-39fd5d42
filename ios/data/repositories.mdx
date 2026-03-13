@@ -1,0 +1,548 @@
+---
+title: Repositories
+description: Repository pattern implementation for data access in Muun iOS app
+---
+
+## Overview
+
+Repositories provide an abstraction layer between the domain logic and data sources (database, network, preferences). The Muun iOS app implements the Repository pattern using a base class with reactive extensions.
+
+## Base Repository
+
+All database repositories extend `BaseDatabaseRepository<T, M>`:
+
+```swift
+class BaseDatabaseRepository<T, M> where T: DatabaseModel, T.Model == M {
+    
+    enum Errors: Error {
+        case readFailed
+    }
+    
+    let queue: DatabaseQueue
+    
+    public init(queue: DatabaseQueue) {
+        self.queue = queue
+    }
+    
+    // Write operations
+    func write(objects: [M]) -> Completable
+    
+    // Read operations
+    func object(with id: T.PrimaryKeyType) -> M?
+    func objects(query: QueryInterfaceRequest<T>) -> [M]?
+    
+    // Reactive operations
+    func watchObjects() -> Observable<[M]>
+    func watchObject(with id: T.PrimaryKeyType) -> Observable<M>
+    
+    // Query operations
+    func count() -> Int
+    func exists(query: QueryInterfaceRequest<T>) -> Bool
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Repository/BaseDatabaseRepository.swift:16`
+
+### Generic Parameters
+
+<ParamField path="T" type="DatabaseModel">
+  Database record type (e.g., `OperationDB`). Must conform to `PersistableRecord`, `FetchableRecord`, and `DatabaseModelConvertible`.
+</ParamField>
+
+<ParamField path="M" type="Model">
+  Domain model type (e.g., `Operation`). The business entity that the app works with.
+</ParamField>
+
+## Key Repositories
+
+The app contains 23 repository implementations:
+
+<Tabs>
+  <Tab title="Core Repositories">
+    - `OperationRepository`: Transaction operations
+    - `UserRepository`: User data and preferences
+    - `KeysRepository`: Cryptographic keys
+    - `SessionRepository`: Authentication sessions
+    - `PublicProfileRepository`: Contact profiles
+  </Tab>
+  <Tab title="Swap Repositories">
+    - `SubmarineSwapRepository`: Lightning submarine swaps
+    - `IncomingSwapRepository`: Incoming Lightning payments
+  </Tab>
+  <Tab title="Utility Repositories">
+    - `BlockchainHeightRepository`: Blockchain sync state
+    - `FeeWindowRepository`: Fee estimation data
+    - `ExchangeRateWindowRepository`: Exchange rates
+    - `FeatureFlagsRepository`: Feature toggles
+  </Tab>
+</Tabs>
+
+## Repository Implementations
+
+### OperationRepository
+
+Manages Bitcoin/Lightning transactions:
+
+```swift
+class OperationRepository: BaseDatabaseRepository<OperationDB, Operation> {
+    
+    private let publicProfileRepository: PublicProfileRepository
+    private let submarineSwapRepository: SubmarineSwapRepository
+    private let incomingSwapRepository: IncomingSwapRepository
+    
+    init(queue: DatabaseQueue,
+         publicProfileRepository: PublicProfileRepository,
+         submarineSwapRepository: SubmarineSwapRepository,
+         incomingSwapRepository: IncomingSwapRepository) {
+        self.publicProfileRepository = publicProfileRepository
+        self.submarineSwapRepository = submarineSwapRepository
+        self.incomingSwapRepository = incomingSwapRepository
+        super.init(queue: queue)
+    }
+    
+    func storeOperations(_ operations: [Operation]) -> Completable {
+        var profiles: [PublicProfile] = []
+        var submarineSwaps: [SubmarineSwap] = []
+        var incomingSwaps: [IncomingSwap] = []
+        
+        // Extract related entities
+        for op in operations {
+            if let senderProfile = op.senderProfile {
+                profiles.append(senderProfile)
+            }
+            if let submarineSwap = op.submarineSwap {
+                submarineSwaps.append(submarineSwap)
+            }
+            if let incomingSwap = op.incomingSwap {
+                incomingSwaps.append(incomingSwap)
+            }
+        }
+        
+        // Write all related data
+        return incomingSwapRepository.write(objects: incomingSwaps)
+            .andThen(submarineSwapRepository.write(objects: submarineSwaps))
+            .andThen(publicProfileRepository.write(objects: profiles))
+            .andThen(write(objects: operations))
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Repository/OperationRepository.swift:24`
+
+#### Reactive Operations Monitoring
+
+```swift
+func watchOperationsChange() -> Observable<OperationsChange> {
+    return ValueObservation.tracking(OperationDB.all()) { db in
+        let numberOfOperations = try OperationDB.fetchCount(db)
+        let lastOperation = try OperationDB
+            .order(Column("creationDate").desc)
+            .limit(1)
+            .fetchOne(db)?
+            .to(using: db)
+        
+        return OperationsChange(
+            numberOfOperations: numberOfOperations,
+            lastOperation: lastOperation
+        )
+    }.rx.observe(in: queue)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Repository/OperationRepository.swift:70`
+
+#### Lazy Loading Support
+
+```swift
+func watchOperationsLazy() -> Observable<LazyLoadedList<Operation>> {
+    return DatabaseRegionObservation(tracking: OperationDB.all())
+        .rx
+        .changes(in: queue)
+        .map { [weak self] db in
+            guard let self = self else {
+                throw MuunError(Errors.readFailed)
+            }
+            
+            let query = OperationDB.all()
+                .order(Column("creationDate").desc)
+            
+            let initialElements = try query.limit(50).fetchAll(db).map {
+                try $0.to(using: db)
+            }
+            
+            return LazyLoadedList<Operation>(
+                total: try OperationDB.fetchCount(db),
+                initialElements: initialElements,
+                onLoadMore: { (limit: Int, offset: Int) in
+                    return self.objects(query: query.limit(limit, offset: offset)) ?? []
+                }
+            )
+        }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Repository/OperationRepository.swift:88`
+
+#### State Queries
+
+```swift
+func getOperationsState() -> OperationsState {
+    let pendingStates = OperationStatus.pendingStates.map { $0.rawValue }
+    let incomingDirection = OperationDirection.INCOMING.rawValue
+    
+    // Check for cancelable operations
+    let cancelableQuery = OperationDB
+        .filter(Column("isReplaceableByFee") == true)
+        .filter(pendingStates.contains(Column("status")))
+        .filter(Column("direction") == incomingDirection)
+    
+    if count(query: cancelableQuery) > 0 {
+        return .cancelable
+    }
+    
+    // Check for pending operations
+    let pendingQuery = OperationDB
+        .filter(pendingStates.contains(Column("status")))
+        .filter(Column("direction") == incomingDirection)
+    
+    if exists(query: pendingQuery) {
+        return .pending
+    }
+    
+    return .confirmed
+}
+
+func hasPendingOperations(includeUnsettled: Bool = true) -> Bool {
+    var pendingStates = OperationStatus.pendingStates.map { $0.rawValue }
+    
+    if includeUnsettled {
+        pendingStates.append(OperationStatus.CONFIRMED.rawValue)
+    }
+    
+    let query = OperationDB
+        .filter(pendingStates.contains(Column("status")))
+    
+    return exists(query: query)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Repository/OperationRepository.swift:120`
+
+### UserRepository
+
+Manages user profile and preferences:
+
+```swift
+public class UserRepository {
+    
+    private let preferences: Preferences
+    
+    init(preferences: Preferences) {
+        self.preferences = preferences
+    }
+    
+    func setUser(_ user: User) {
+        preferences.set(object: user, forKey: .user)
+        if user.hasRecoveryCodeChallengeKey {
+            preferences.set(value: true, forKey: .hasRecoveryCode)
+        }
+    }
+    
+    public func watchUser() -> Observable<User?> {
+        return preferences.watchObject(key: .user)
+    }
+    
+    public func getUser() -> User? {
+        return preferences.object(forKey: .user)
+    }
+    
+    public func isUnrecoverableUser() -> Bool {
+        guard let user = getUser() else {
+            return true
+        }
+        return !user.hasPasswordChallengeKey && !user.hasRecoveryCodeChallengeKey
+    }
+    
+    public func watchAppState() -> Observable<Bool?> {
+        return preferences.watchBool(key: .appInForeground)
+    }
+    
+    func setUserEmail(_ email: String) {
+        preferences.set(value: email, forKey: .email)
+    }
+    
+    func getUserEmail() -> String? {
+        return getUser()?.email
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Repository/UserRepository.swift:12`
+
+### KeychainRepository
+
+Provides secure storage for sensitive data:
+
+```swift
+public class KeychainRepository {
+    private let keyPrefix: String
+    private let group: String
+    
+    public enum storedKeys: String, CaseIterable {
+        case deviceCheckToken
+        case fallbackDeviceToken
+    }
+    
+    init(keyPrefix: String = Identifiers.bundleId,
+         group: String = Identifiers.group) {
+        self.keyPrefix = keyPrefix
+        self.group = group
+    }
+    
+    public func store(_ string: String, at key: String) throws {
+        let data = string.data(using: .utf8, allowLossyConversion: true)
+        let query = buildQuery(for: key, forInsert: true)
+        let toSet = [kSecValueData as String: data!]
+        
+        // Try to update first, then insert if not found
+        var status = SecItemUpdate(query as CFDictionary, toSet as CFDictionary)
+        if status == errSecItemNotFound {
+            let addQuery = query.merging(toSet) { (k, _) in k }
+            status = SecItemAdd(addQuery as CFDictionary, nil)
+        }
+        
+        guard status == errSecSuccess else {
+            throw MuunError(SecureStorage.Errors.secureStorageError)
+        }
+    }
+    
+    public func get(_ key: String) throws -> String {
+        var query = buildQuery(for: key, forInsert: false)
+        query[kSecReturnData as String] = true
+        
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        
+        guard status == errSecSuccess,
+            let value = item as? Data else {
+            throw MuunError(SecureStorage.Errors.secureStorageError)
+        }
+        
+        guard let ret = String(data: value, encoding: .utf8) else {
+            throw MuunError(SecureStorage.Errors.invalidData)
+        }
+        
+        return ret
+    }
+    
+    func has(_ key: String) throws -> Bool {
+        let query = buildQuery(for: key, forInsert: false)
+        let status = SecItemCopyMatching(query as CFDictionary, nil)
+        
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw MuunError(SecureStorage.Errors.secureStorageError)
+        }
+        
+        return status == errSecSuccess
+    }
+    
+    func wipe(preservePin: Bool = false) {
+        // Wipe all keychain data, optionally preserving PIN
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/KeychainRepository.swift:9`
+
+## Repository Patterns
+
+### Write Operations
+
+<CodeGroup>
+```swift Single Object
+repository.write(objects: [operation])
+    .subscribe(
+        onCompleted: {
+            print("Operation saved")
+        },
+        onError: { error in
+            print("Error: \(error)")
+        }
+    )
+```
+
+```swift Multiple Objects
+repository.write(objects: operations)
+    .andThen(relatedRepository.write(objects: related))
+    .subscribe(
+        onCompleted: {
+            print("All saved")
+        }
+    )
+```
+
+```swift Chained Writes
+incomingSwapRepository.write(objects: swaps)
+    .andThen(submarineSwapRepository.write(objects: submarines))
+    .andThen(operationRepository.write(objects: operations))
+    .subscribe()
+```
+</CodeGroup>
+
+### Read Operations
+
+<CodeGroup>
+```swift Synchronous
+// Get single object
+let operation = repository.object(with: id)
+
+// Query multiple objects
+let query = OperationDB.filter(Column("status") == "PENDING")
+let pending = repository.objects(query: query)
+
+// Check existence
+let hasPending = repository.exists(query: query)
+```
+
+```swift Reactive
+// Watch all objects
+repository.watchObjects()
+    .subscribe(onNext: { operations in
+        print("Operations updated: \(operations.count)")
+    })
+
+// Watch single object
+repository.watchObject(with: id)
+    .subscribe(onNext: { operation in
+        print("Operation changed: \(operation.status)")
+    })
+```
+</CodeGroup>
+
+### Query Building
+
+```swift
+// Simple filter
+let query = OperationDB.filter(Column("status") == "PENDING")
+
+// Multiple conditions
+let query = OperationDB
+    .filter(Column("status") == "CONFIRMED")
+    .filter(Column("amount") > 100000)
+    .order(Column("creationDate").desc)
+
+// Joins
+let query = OperationDB
+    .joining(required: OperationDB.submarineSwap)
+    .filter(Column("status") == "SWAP_PENDING")
+
+// Limit and offset
+let query = OperationDB
+    .order(Column("creationDate").desc)
+    .limit(50, offset: 0)
+```
+
+## Error Handling
+
+```swift
+enum Errors: Error {
+    case readFailed
+}
+
+// Repositories throw or return nil on errors
+func object(with id: T.PrimaryKeyType) -> M? {
+    return queue.read { db in
+        do {
+            return try T.fetchOne(db, key: id)?.to(using: db)
+        } catch {
+            return nil
+        }
+    }
+}
+
+// Count operations log errors but return 0
+func count() -> Int {
+    return queue.read { db in
+        do {
+            return try T.fetchCount(db)
+        } catch {
+            Logger.log(error: error)
+            return 0
+        }
+    }
+}
+```
+
+## Database Model Conversion
+
+Repositories convert between database records and domain models:
+
+```swift
+protocol DatabaseModelConvertible {
+    associatedtype Model
+    associatedtype PrimaryKeyType: DatabaseValueConvertible
+    
+    init(from: Model)
+    func to(using: Database) throws -> Model
+}
+
+// Example: OperationDB <-> Operation
+struct OperationDB: DatabaseModel {
+    var id: Int
+    var status: String
+    var amountInSatoshis: Int
+    
+    init(from operation: Operation) {
+        self.id = operation.id ?? 0
+        self.status = operation.status.rawValue
+        self.amountInSatoshis = operation.amount.inSatoshis.value
+    }
+    
+    func to(using db: Database) throws -> Operation {
+        return Operation(
+            id: id,
+            status: OperationStatus(rawValue: status)!,
+            amount: BitcoinAmount(inSatoshis: Satoshis(value: amountInSatoshis))
+        )
+    }
+}
+```
+
+## Benefits
+
+<AccordionGroup>
+  <Accordion title="Abstraction">
+    - Domain layer doesn't know about GRDB
+    - Easy to swap database implementations
+    - Testable with mock repositories
+  </Accordion>
+
+  <Accordion title="Type Safety">
+    - Generic types ensure compile-time safety
+    - Protocol requirements enforced
+    - No runtime casting needed
+  </Accordion>
+
+  <Accordion title="Reactive">
+    - Automatic UI updates on data changes
+    - Observable streams for all data
+    - Composable operations with RxSwift
+  </Accordion>
+
+  <Accordion title="Consistency">
+    - All repositories follow same pattern
+    - Shared base class reduces duplication
+    - Predictable API across data sources
+  </Accordion>
+</AccordionGroup>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Database" icon="database" href="/ios/data/database">
+    GRDB database implementation
+  </Card>
+  <Card title="Secure Storage" icon="lock" href="/ios/data/secure-storage">
+    Keychain and secure storage
+  </Card>
+</CardGroup>

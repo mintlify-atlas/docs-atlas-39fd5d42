@@ -1,0 +1,439 @@
+---
+title: 'Address Generation'
+description: 'Generate Bitcoin addresses from V1 to V6 in Muun Wallet'
+---
+
+## Overview
+
+Muun Wallet supports six address versions, evolving from legacy P2PKH to modern Taproot addresses. Each version represents improvements in security, privacy, or transaction costs.
+
+## Address Version Constants
+
+```go
+const (
+    AddressVersionV1      = 1  // P2PKH
+    AddressVersionV2      = 2  // P2SH (2-of-2 multisig)
+    AddressVersionV3      = 3  // P2WSH (Native SegWit)
+    AddressVersionV4      = 4  // P2WSH (SegWit v0)
+    AddressVersionV5      = 5  // P2TR (Taproot MuSig2 v0.4.0)
+    AddressVersionSwapsV1 = 101
+    AddressVersionSwapsV2 = 102
+)
+```
+
+## Version 1: P2PKH (Legacy)
+
+### Description
+Pay-to-Public-Key-Hash addresses. Simple single-signature addresses.
+
+### Implementation
+
+<CodeGroup>
+
+```go Go
+func CreateAddressV1(
+    userKey *hdkeychain.ExtendedKey,
+    path string,
+    network *chaincfg.Params,
+) (*WalletAddress, error) {
+    pubKey, err := userKey.ECPubKey()
+    if err != nil {
+        return nil, err
+    }
+    address, err := btcutil.NewAddressPubKey(
+        pubKey.SerializeCompressed(),
+        network,
+    )
+    if err != nil {
+        return nil, err
+    }
+    return &WalletAddress{
+        address:        address.EncodeAddress(),
+        version:        V1,
+        derivationPath: path,
+    }, nil
+}
+```
+
+```swift iOS
+let address = try! LibwalletCreateAddressV1(
+    userKey,
+    path: "m/0/0",
+    network: network
+)
+```
+
+</CodeGroup>
+
+### Features
+- Single signature
+- Highest fees
+- Starts with "1" on mainnet
+- Legacy compatibility
+
+## Version 2: P2SH Multisig
+
+### Description
+2-of-2 multisig wrapped in Pay-to-Script-Hash.
+
+### Implementation
+
+```go
+func CreateAddressV2(
+    userKey, muunKey *hdkeychain.ExtendedKey,
+    path string,
+    network *chaincfg.Params,
+) (*WalletAddress, error) {
+    script, err := CreateRedeemScriptV2(userKey, muunKey, network)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate redeem script v2: %w", err)
+    }
+    
+    address, err := btcutil.NewAddressScriptHash(script, network)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate multisig address: %w", err)
+    }
+    
+    return &WalletAddress{
+        address:        address.EncodeAddress(),
+        version:        V2,
+        derivationPath: path,
+    }, nil
+}
+```
+
+### Redeem Script
+
+The redeem script for V2 addresses:
+
+```go
+func CreateRedeemScriptV2(
+    userKey, muunKey *hdkeychain.ExtendedKey,
+    network *chaincfg.Params,
+) ([]byte, error) {
+    userPublicKey, err := userKey.ECPubKey()
+    if err != nil {
+        return nil, err
+    }
+    muunPublicKey, err := muunKey.ECPubKey()
+    if err != nil {
+        return nil, err
+    }
+    
+    return txscript.MultiSigScript([]*btcutil.AddressPubKey{
+        userAddress,
+        muunAddress,
+    }, 2)
+}
+```
+
+### Features
+- 2-of-2 multisig
+- Starts with "3" on mainnet
+- Better security than V1
+- Higher fees than SegWit
+
+## Version 3 & 4: Native SegWit
+
+### Description
+Native SegWit (P2WSH) 2-of-2 multisig addresses with lower fees.
+
+### Features
+- 75% fee reduction vs V2
+- Bech32 encoding (starts with "bc1")
+- Better for batching
+- Malleability protection
+
+## Version 5: Taproot MuSig2 v0.4.0
+
+### Description
+Taproot addresses using MuSig2 v0.4.0 for key aggregation.
+
+### Implementation
+
+<CodeGroup>
+
+```go Go (libwallet/addresses/v5.go:12)
+func CreateAddressV5(
+    userKey, muunKey *hdkeychain.ExtendedKey,
+    path string,
+    network *chaincfg.Params,
+) (*WalletAddress, error) {
+    witnessProgram, err := CreateWitnessScriptV5(userKey, muunKey)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate witness script v5: %w", err)
+    }
+    
+    address, err := btcutilw.NewAddressTaprootKey(witnessProgram, network)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &WalletAddress{
+        address:        address.EncodeAddress(),
+        version:        V5,
+        derivationPath: path,
+    }, nil
+}
+```
+
+```swift iOS
+let userPubKey = try! userPrivKey.publicKey()
+let muunPubKey: LibwalletHDPublicKey = // from server
+
+let address = try! LibwalletCreateAddressV5(
+    userPubKey,
+    muunPubKey
+)
+
+print("Taproot address: \(address.address())")
+```
+
+</CodeGroup>
+
+### Witness Script Generation
+
+```go
+func CreateWitnessScriptV5(
+    userKey, muunKey *hdkeychain.ExtendedKey,
+) ([]byte, error) {
+    userPublicKey, err := userKey.ECPubKey()
+    if err != nil {
+        return nil, fmt.Errorf("error getting pub key: %w", err)
+    }
+    muunPublicKey, err := muunKey.ECPubKey()
+    if err != nil {
+        return nil, fmt.Errorf("error getting pub key: %w", err)
+    }
+    
+    pubKeys := [][]byte{
+        userPublicKey.SerializeCompressed(),
+        muunPublicKey.SerializeCompressed(),
+    }
+    
+    tweak := musig.KeySpendOnlyTweak()
+    
+    aggregateKey, err := musig.Musig2CombinePubKeysWithTweak(
+        musig.Musig2v040Muun,
+        pubKeys,
+        tweak,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("error combining keys: %w", err)
+    }
+    
+    // Extract x-only public key (drop parity byte)
+    xOnlyCombined := aggregateKey.FinalKey.SerializeCompressed()[1:]
+    
+    return xOnlyCombined, nil
+}
+```
+
+### Features
+- Smallest transaction size
+- Lowest fees
+- Best privacy (looks like single-sig)
+- MuSig2 key aggregation
+- BIP 86 key-spend only
+
+## Version 6: Taproot MuSig2 v1.0.0
+
+### Description
+Latest Taproot implementation using MuSig2 v1.0.0 (BIP 327).
+
+### Implementation
+
+```go
+func CreateAddressV6(
+    userKey, muunKey *hdkeychain.ExtendedKey,
+    path string,
+    network *chaincfg.Params,
+) (*WalletAddress, error) {
+    witnessProgram, err := CreateWitnessScriptV6(userKey, muunKey)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate witness script v5: %w", err)
+    }
+    
+    address, err := btcutilw.NewAddressTaprootKey(witnessProgram, network)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &WalletAddress{
+        address:        address.EncodeAddress(),
+        version:        V6,
+        derivationPath: path,
+    }, nil
+}
+```
+
+### Difference from V5
+
+The only difference is the MuSig version:
+
+```go
+aggregateKey, err := musig.Musig2CombinePubKeysWithTweak(
+    musig.Musig2v100,  // v1.0.0 instead of v0.4.0
+    pubKeys,
+    tweak,
+)
+```
+
+### Features
+- Standard MuSig2 v1.0.0 implementation
+- Follows BIP 327
+- Better nonce generation
+- More secure than v0.4.0
+
+## Generic Address Creation
+
+Create any version dynamically:
+
+```go
+func Create(
+    version int,
+    userKey, muunKey *hdkeychain.ExtendedKey,
+    path string,
+    network *chaincfg.Params,
+) (*WalletAddress, error) {
+    switch version {
+    case V1:
+        return CreateAddressV1(userKey, path, network)
+    case V2:
+        return CreateAddressV2(userKey, muunKey, path, network)
+    case V3:
+        return CreateAddressV3(userKey, muunKey, path, network)
+    case V4:
+        return CreateAddressV4(userKey, muunKey, path, network)
+    case V5:
+        return CreateAddressV5(userKey, muunKey, path, network)
+    case V6:
+        return CreateAddressV6(userKey, muunKey, path, network)
+    default:
+        return nil, fmt.Errorf("unknown or unsupported version %v", version)
+    }
+}
+```
+
+## WalletAddress Type
+
+```go
+type WalletAddress struct {
+    version        int
+    derivationPath string
+    address        string
+}
+
+func (a *WalletAddress) Version() int {
+    return a.version
+}
+
+func (a *WalletAddress) DerivationPath() string {
+    return a.derivationPath
+}
+
+func (a *WalletAddress) Address() string {
+    return a.address
+}
+```
+
+## MuSig Version Selection
+
+Different address versions use different MuSig implementations:
+
+```go
+func MusigVersionForAddress(addressVersion int) musig.MusigVersion {
+    switch addressVersion {
+    case V1, V2, V3, V4, V5, SubmarineSwapV1, SubmarineSwapV2, IncomingSwap:
+        return musig.Musig2v040Muun
+    default:
+        return musig.Musig2v100
+    }
+}
+```
+
+## Comparison Table
+
+<Tabs>
+  <Tab title="Features">
+    | Version | Type | Multisig | Fee Cost | Privacy |
+    |---------|------|----------|----------|----------|
+    | V1 | P2PKH | No | Highest | Low |
+    | V2 | P2SH | Yes | High | Low |
+    | V3 | P2WSH | Yes | Medium | Medium |
+    | V4 | P2WSH | Yes | Medium | Medium |
+    | V5 | P2TR | Yes (MuSig) | Lowest | High |
+    | V6 | P2TR | Yes (MuSig) | Lowest | High |
+  </Tab>
+  
+  <Tab title="Encoding">
+    | Version | Mainnet Prefix | Testnet Prefix | Encoding |
+    |---------|----------------|----------------|----------|
+    | V1 | 1 | m/n | Base58 |
+    | V2 | 3 | 2 | Base58 |
+    | V3 | bc1 | tb1 | Bech32 |
+    | V4 | bc1 | tb1 | Bech32 |
+    | V5 | bc1p | tb1p | Bech32m |
+    | V6 | bc1p | tb1p | Bech32m |
+  </Tab>
+  
+  <Tab title="Security">
+    | Version | Malleability | Script Type | Upgrade Path |
+    |---------|--------------|-------------|---------------|
+    | V1 | Vulnerable | Legacy | → V2 |
+    | V2 | Vulnerable | Legacy | → V3 |
+    | V3 | Protected | SegWit | → V5 |
+    | V4 | Protected | SegWit | → V5 |
+    | V5 | Protected | Taproot | → V6 |
+    | V6 | Protected | Taproot | Latest |
+  </Tab>
+</Tabs>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Use Latest Version">
+    Always generate new addresses using V6 for best fees and privacy.
+  </Accordion>
+  
+  <Accordion title="Support All Versions">
+    Users may have UTXOs in older address formats. Support spending from all versions.
+  </Accordion>
+  
+  <Accordion title="Validate Derivation Paths">
+    Always validate derivation paths match expected format:
+    ```swift
+    guard address.derivationPath().hasPrefix("m/") else {
+        throw AddressError.invalidPath
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Cache Public Keys">
+    Deriving keys is expensive. Cache derived public keys:
+    ```swift
+    let cache = NSCache<NSString, LibwalletHDPublicKey>()
+    let key = "\(basePath)/\(index)"
+    if let cached = cache.object(forKey: key as NSString) {
+        return cached
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Transaction Creation" icon="file-invoice" href="/libwallet/transactions">
+    Build transactions using generated addresses
+  </Card>
+  <Card title="MuSig2 Signing" icon="pen-nib" href="/libwallet/signing">
+    Sign Taproot transactions with MuSig2
+  </Card>
+  <Card title="Key Derivation" icon="key" href="/libwallet/crypto/keys">
+    Understand HD key derivation
+  </Card>
+  <Card title="Emergency Kit" icon="file-pdf" href="/libwallet/emergency-kit/generation">
+    Generate recovery PDFs with addresses
+  </Card>
+</CardGroup>

@@ -1,0 +1,629 @@
+---
+title: Domain Services
+description: Domain services and business logic utilities in Muun iOS app
+---
+
+## Overview
+
+Domain services encapsulate complex business logic that doesn't belong in a single model or action. They coordinate operations, perform calculations, and provide reusable domain logic.
+
+## Service Categories
+
+<Tabs>
+  <Tab title="Network Services">
+    - `HoustonService`: Main API communication
+    - `BaseService`: HTTP client foundation
+    - `WalletService`: Libwallet integration
+    - `RealTimeFees`: Fee estimation service
+  </Tab>
+  <Tab title="Domain Services">
+    - `ReachabilityService`: Network connectivity
+    - `DeviceCheckAdapter`: Device attestation
+    - `NfcSession`: Hardware wallet NFC
+    - `FeeBumpFunctionsProvider`: Fee calculation
+  </Tab>
+  <Tab title="Selectors">
+    - `FeatureFlagsSelector`: Feature toggle logic
+    - `ExportKeysSelector`: Key export operations
+  </Tab>
+</Tabs>
+
+## Base Service
+
+All network services extend `BaseService`:
+
+```swift
+public class BaseService {
+    
+    private let preferences: Preferences
+    private let urlSession: URLSession
+    private let sessionRepository: SessionRepository
+    private let debugRequestsRepository: DebugRequestsRepository
+    private let deviceCheckTokenProvider: DeviceCheckTokenProvider
+    private let sendAuth: Bool
+    private let backgroundExecutionMetricsProvider: BackgroundExecutionMetricsProvider
+    
+    lazy public var baseURL = getBaseURL()
+    private static let maxRetries = 3
+    
+    public func getBaseURL() -> String {
+        fatalError("MUST OVERRIDE")
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Service/Base/BaseService.swift:39`
+
+### HTTP Methods
+
+<CodeGroup>
+```swift GET
+func get<T: Decodable>(
+    _ path: String,
+    queryParams: [String: Any]? = [:],
+    andReturn model: T.Type,
+    maxRetries: Int = BaseService.maxRetries
+) -> Single<T>
+```
+
+```swift POST
+func post<T: Decodable>(
+    _ path: String,
+    body: Data? = nil,
+    queryParams: [String: Any]? = [:],
+    andReturn model: T.Type,
+    maxRetries: Int = BaseService.maxRetries,
+    shouldForceDeviceCheckToken: Bool = false
+) -> Single<T>
+```
+
+```swift PUT
+func put<T: Decodable>(
+    _ path: String,
+    body: Data? = nil,
+    queryParams: [String: Any]? = [:],
+    andReturn model: T.Type,
+    maxRetries: Int = BaseService.maxRetries
+) -> Single<T>
+```
+
+```swift PATCH
+func patch<T: Decodable>(
+    _ path: String,
+    body: Data? = nil,
+    queryParams: [String: Any]? = [:],
+    andReturn model: T.Type,
+    maxRetries: Int = BaseService.maxRetries
+) -> Single<T>
+```
+
+```swift DELETE
+func delete<T: Decodable>(
+    _ path: String,
+    body: Data? = nil,
+    queryParams: [String: Any]? = [:],
+    andReturn model: T.Type,
+    maxRetries: Int = BaseService.maxRetries
+) -> Single<T>
+```
+</CodeGroup>
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Service/Base/BaseService.swift:72`
+
+### Request Headers
+
+BaseService automatically adds headers to all requests:
+
+```swift
+var request = BaseRequest(url, method, body: body, queryParams: queryParams)
+    .addHeader(key: "Content-Type", value: "application/json")
+    .addHeader(key: "Accept", value: "application/json")
+    .addHeader(key: "X-Client-Version", value: Constant.buildVersion)
+    .addHeader(key: "X-Client-Version-Name", value: Constant.buildVersionName)
+    .addHeader(key: "X-Client-Language", value: Locale.current.languageCode ?? "en")
+    .addHeader(key: "X-Client-Type", value: "FALCON")
+    .addHeader(key: "X-Idempotency-Key", value: UUID().uuidString)
+    .addHeader(key: "X-Retry-Count", value: "0")
+
+if sendAuth {
+    if try sessionRepository.hasAuthToken() {
+        request = request.addHeader(
+            key: "Authorization",
+            value: try sessionRepository.getAuthToken()
+        )
+    }
+}
+
+if let deviceToken = deviceCheckTokenProvider.provide() {
+    request = request.addHeader(key: "X-Device-Token", value: deviceToken)
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Service/Base/BaseService.swift:212`
+
+### Automatic Retry
+
+```swift
+func shouldRetry(error: Error) -> Bool {
+    if let muunError = error as? MuunError,
+       let e = muunError.kind as? ServiceError {
+        switch e {
+        case .serviceFailure, .timeOut:
+            return true
+        default:
+            return false
+        }
+    }
+    return false
+}
+
+// Retry logic in performHTTPRequest
+if self.shouldRetry(error: someError) && maxRetries > 1 {
+    Logger.log(.info, "Retrying...")
+    let newRequest = self.updateRetryCountHeader(request)
+    
+    self.performHTTPRequest(
+        request: newRequest,
+        model: model,
+        maxRetries: maxRetries - 1,
+        success: success,
+        failure: failure
+    )
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Service/Base/BaseService.swift:344`
+
+### Error Parsing
+
+```swift
+func parseError(data: Data?, error: Error?, response: URLResponse?) -> Error? {
+    // 5xx errors
+    if let httpResponse = response as? HTTPURLResponse {
+        if httpResponse.statusCode >= 500 {
+            return MuunError(ServiceError.serviceFailure)
+        }
+    }
+    
+    // Network errors
+    if let e = error as? URLError {
+        switch e.code {
+        case .timedOut:
+            return MuunError(ServiceError.timeOut)
+            
+        case .cannotFindHost,
+             .cannotConnectToHost,
+             .notConnectedToInternet,
+             .networkConnectionLost:
+            return MuunError(ServiceError.internetError)
+            
+        default:
+            return MuunError(e)
+        }
+    }
+    
+    // Custom API errors
+    guard let data = data else { return nil }
+    
+    let jsonDecoder = JSONDecoder()
+    do {
+        let error = try jsonDecoder.decode(DeveloperError.self, from: data)
+        return MuunError(ServiceError.customError(error))
+    } catch {
+        return nil
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Service/Base/BaseService.swift:359`
+
+## Houston Service
+
+The main API service for communicating with Muun backend:
+
+```swift
+class HoustonService: BaseService {
+    
+    override func getBaseURL() -> String {
+        return Environment.current.houstonURL
+    }
+    
+    // User operations
+    func fetchUser() -> Single<User>
+    func updateUser(_ user: User) -> Single<User>
+    
+    // Operations
+    func fetchOperations() -> Single<[Operation]>
+    func createOperation(amount: Satoshis, address: String, fee: Satoshis) -> Single<Operation>
+    func submitOperation(_ operation: Operation) -> Single<Operation>
+    
+    // Swaps
+    func createSubmarineSwap(invoice: String) -> Single<SubmarineSwap>
+    func fulfillIncomingSwap(uuid: String) -> Completable
+    
+    // Real-time data
+    func fetchExchangeRates() -> Single<ExchangeRateWindow>
+    func fetchFees() -> Single<FeeWindow>
+    func fetchBlockchainHeight() -> Single<Int>
+    
+    // Authentication
+    func login(email: String, password: String) -> Single<LoginResponse>
+    func createSession(gcmToken: String) -> Single<Session>
+}
+```
+
+### Example Usage
+
+```swift
+class FetchOperationsAction: AsyncAction<[Operation]> {
+    private let houstonService: HoustonService
+    private let operationRepository: OperationRepository
+    
+    func run() {
+        let single = houstonService.fetchOperations()
+            .do(onSuccess: { [weak self] operations in
+                _ = self?.operationRepository
+                    .storeOperations(operations)
+                    .subscribe()
+            })
+        
+        runSingle(single)
+    }
+}
+```
+
+## Wallet Service
+
+Interface to the Libwallet Go library for Bitcoin operations:
+
+```swift
+class WalletService {
+    
+    func createHDWallet(seed: Data) throws -> HDWallet
+    
+    func deriveAddress(wallet: HDWallet, path: String) throws -> String
+    
+    func signTransaction(
+        wallet: HDWallet,
+        transaction: Transaction,
+        privateKey: String
+    ) throws -> String
+    
+    func buildTransaction(
+        inputs: [Input],
+        outputs: [Output],
+        feeRate: Int
+    ) throws -> Transaction
+    
+    func validateAddress(_ address: String) -> Bool
+    
+    func saveBool(key: String, value: Bool)
+    func loadBool(key: String) -> Bool
+}
+```
+
+### Example Usage
+
+```swift
+class SignTransactionAction: AsyncAction<Operation> {
+    private let walletService: WalletService
+    private let keysRepository: KeysRepository
+    
+    func run(operation: Operation) {
+        let single = Single.deferred { [weak self] in
+            guard let self = self,
+                  let transaction = operation.transaction else {
+                throw TransactionError.invalid
+            }
+            
+            let privateKey = try self.keysRepository.getPrivateKey()
+            let wallet = try self.keysRepository.getHDWallet()
+            
+            let signedTx = try self.walletService.signTransaction(
+                wallet: wallet,
+                transaction: transaction,
+                privateKey: privateKey
+            )
+            
+            var signed = operation
+            signed.transaction?.hash = signedTx
+            signed.status = .SIGNED
+            
+            return Single.just(signed)
+        }
+        
+        runSingle(single)
+    }
+}
+```
+
+## Domain Services
+
+### ReachabilityService
+
+Monitors network connectivity:
+
+```swift
+class ReachabilityService {
+    
+    func watchConnectivity() -> Observable<Bool> {
+        // Monitor network changes
+    }
+    
+    func isConnected() -> Bool {
+        // Check current connectivity
+    }
+}
+```
+
+**Usage:**
+```swift
+reachabilityService.watchConnectivity()
+    .subscribe(onNext: { isConnected in
+        if isConnected {
+            syncAction.run()
+        }
+    })
+```
+
+### DeviceCheckAdapter
+
+Provides device attestation tokens:
+
+```swift
+class DeviceCheckAdapter {
+    
+    func generateToken() -> String? {
+        // Generate DeviceCheck token
+    }
+    
+    func isSupported() -> Bool {
+        // Check if DeviceCheck is available
+    }
+}
+```
+
+### NfcSession
+
+Manages NFC communication with hardware wallets:
+
+```swift
+class NfcSession {
+    
+    func start() -> Observable<NFCEvent>
+    func send(command: Data) -> Single<Data>
+    func close()
+}
+```
+
+## Selectors
+
+Selectors provide complex query and calculation logic:
+
+### FeatureFlagsSelector
+
+```swift
+class FeatureFlagsSelector {
+    private let featureFlagsRepository: FeatureFlagsRepository
+    private let userRepository: UserRepository
+    
+    func isFeatureEnabled(_ feature: Feature) -> Bool {
+        let flags = featureFlagsRepository.getFlags()
+        let user = userRepository.getUser()
+        
+        // Apply flag logic
+        return evaluateFlag(feature, flags: flags, user: user)
+    }
+    
+    func watchFeatureFlag(_ feature: Feature) -> Observable<Bool> {
+        return Observable.combineLatest(
+            featureFlagsRepository.watchFlags(),
+            userRepository.watchUser()
+        )
+        .map { (flags, user) in
+            return self.evaluateFlag(feature, flags: flags, user: user)
+        }
+    }
+}
+```
+
+### ExportKeysSelector
+
+```swift
+class ExportKeysSelector {
+    private let keysRepository: KeysRepository
+    private let userRepository: UserRepository
+    
+    func canExportKeys() -> Bool {
+        guard let user = userRepository.getUser() else {
+            return false
+        }
+        
+        return user.hasPasswordChallengeKey && !user.hasExportedKeys
+    }
+    
+    func getExportableKeys() -> [String: String] {
+        return [
+            "private_key": try! keysRepository.getPrivateKey(),
+            "base_path": try! keysRepository.getBaseDerivationPath()
+        ]
+    }
+}
+```
+
+## Service Patterns
+
+### Dependency Injection
+
+```swift
+class ServiceDependencyContainer {
+    // Base dependencies
+    let preferences: Preferences
+    let urlSession: URLSession
+    
+    // Services
+    lazy var houstonService: HoustonService = {
+        return HoustonService(
+            preferences: preferences,
+            urlSession: urlSession,
+            sessionRepository: sessionRepository,
+            debugRequestsRepository: debugRequestsRepository,
+            deviceCheckTokenProvider: deviceCheckTokenProvider,
+            backgroundExecutionMetricsProvider: backgroundMetricsProvider,
+            sendAuth: true
+        )
+    }()
+    
+    lazy var walletService: WalletService = {
+        return WalletService()
+    }()
+}
+```
+
+### Observable Services
+
+```swift
+class FeeService {
+    private let houstonService: HoustonService
+    private let feeRepository: FeeWindowRepository
+    
+    func watchFees() -> Observable<FeeWindow> {
+        // Watch local fees
+        return feeRepository.watchFeeWindow()
+    }
+    
+    func refreshFees() -> Completable {
+        return houstonService.fetchFees()
+            .flatMapCompletable { [weak self] fees in
+                return self?.feeRepository.store(fees) ?? .empty()
+            }
+    }
+}
+```
+
+### Error Handling
+
+```swift
+class ServiceWithRetry {
+    
+    func fetchWithRetry<T>(
+        _ operation: @escaping () -> Single<T>
+    ) -> Single<T> {
+        return operation()
+            .retry(3)
+            .catchError { error in
+                // Log error
+                Logger.log(error: error)
+                
+                // Rethrow or provide fallback
+                return Single.error(error)
+            }
+    }
+}
+```
+
+## Testing Services
+
+### Mock Services
+
+```swift
+class MockHoustonService: HoustonService {
+    var mockOperations: [Operation] = []
+    var shouldFail = false
+    
+    override func fetchOperations() -> Single<[Operation]> {
+        if shouldFail {
+            return Single.error(ServiceError.serviceFailure)
+        }
+        return Single.just(mockOperations)
+    }
+}
+
+// In tests
+let mockService = MockHoustonService()
+mockService.mockOperations = [testOperation1, testOperation2]
+
+let action = FetchOperationsAction(
+    houstonService: mockService,
+    operationRepository: mockRepository
+)
+
+action.run()
+
+action.getValue()
+    .subscribe(onSuccess: { operations in
+        XCTAssertEqual(operations.count, 2)
+    })
+```
+
+### Service Integration Tests
+
+```swift
+class HoustonServiceIntegrationTests: XCTestCase {
+    
+    var service: HoustonService!
+    
+    override func setUp() {
+        // Use test environment
+        Environment.current = .test
+        
+        service = HoustonService(
+            preferences: testPreferences,
+            urlSession: URLSession.shared,
+            // ... other dependencies
+        )
+    }
+    
+    func testFetchOperations() {
+        let expectation = self.expectation(description: "Fetch operations")
+        
+        service.fetchOperations()
+            .subscribe(
+                onSuccess: { operations in
+                    XCTAssertGreaterThan(operations.count, 0)
+                    expectation.fulfill()
+                },
+                onError: { error in
+                    XCTFail("Failed with error: \(error)")
+                }
+            )
+        
+        waitForExpectations(timeout: 10)
+    }
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Single Responsibility">
+    Each service should have a single, well-defined purpose. Don't create god services that do everything.
+  </Accordion>
+
+  <Accordion title="Reactive APIs">
+    Services should return Observable or Single for asynchronous operations, not use callbacks.
+  </Accordion>
+
+  <Accordion title="Error Handling">
+    Let errors propagate through RxSwift. Don't catch and ignore errors in services.
+  </Accordion>
+
+  <Accordion title="Testability">
+    Design services with interfaces (protocols) so they can be mocked for testing.
+  </Accordion>
+
+  <Accordion title="Stateless">
+    Services should be stateless when possible. State belongs in repositories or models.
+  </Accordion>
+</AccordionGroup>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Use Cases" icon="gears" href="/ios/domain/use-cases">
+    Actions that use services
+  </Card>
+  <Card title="Repositories" icon="database" href="/ios/data/repositories">
+    Data access layer
+  </Card>
+</CardGroup>

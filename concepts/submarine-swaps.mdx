@@ -1,0 +1,610 @@
+---
+title: Submarine Swaps
+description: Atomic swaps between Bitcoin on-chain and Lightning Network
+---
+
+## What are Submarine Swaps?
+
+**Submarine swaps** are atomic swaps between Bitcoin's on-chain layer and the Lightning Network. They enable Muun to provide seamless Lightning functionality without requiring users to manage Lightning channels.
+
+The name "submarine" refers to funds "diving" from the visible on-chain layer down to the Lightning Network layer, or "surfacing" from Lightning back to on-chain.
+
+<Info>
+Submarine swaps use **Hash Time-Locked Contracts (HTLCs)** to ensure atomicity: the swap either completes fully or refunds completely. No intermediate state where funds are lost is possible.
+</Info>
+
+## Types of Swaps
+
+Muun implements two types of swaps:
+
+<CardGroup cols={2}>
+  <Card title="Submarine Swap (Outgoing)" icon="arrow-up">
+    Convert on-chain BTC → Lightning payment
+  </Card>
+  <Card title="Incoming Swap" icon="arrow-down">
+    Convert Lightning payment → on-chain BTC
+  </Card>
+</CardGroup>
+
+## Submarine Swap Structure
+
+### Data Model
+
+```go
+// Source: libwallet/swaps/swaps.go:16-46
+type SubmarineSwap struct {
+    Invoice       string
+    Receiver      SubmarineSwapReceiver
+    FundingOutput SubmarineSwapFundingOutput
+    PreimageInHex string
+}
+
+type SubmarineSwapFundingOutput struct {
+    ScriptVersion          int64
+    OutputAddress          string
+    OutputAmount           int64
+    ConfirmationsNeeded    int
+    ServerPaymentHashInHex string
+    ServerPublicKeyInHex   string
+    UserLockTime           int64
+    
+    // v1 only
+    UserRefundAddress *addresses.WalletAddress
+    
+    // v2 only
+    ExpirationInBlocks int64
+    UserPublicKey      *hdkeychain.ExtendedKey
+    MuunPublicKey      *hdkeychain.ExtendedKey
+    KeyPath            string
+}
+
+type SubmarineSwapReceiver struct {
+    Alias     string
+    PublicKey string
+}
+```
+
+### Key Descriptor
+
+For deriving keys at specific paths:
+
+```go
+// Source: libwallet/swaps/swaps.go:48-77
+type KeyDescriptor struct {
+    Key  *hdkeychain.ExtendedKey
+    Path string
+}
+
+func (d *KeyDescriptor) DeriveTo(path string) (*hdkeychain.ExtendedKey, error) {
+    key := d.Key
+    
+    currentPath, err := hdpath.Parse(d.Path)
+    if err != nil {
+        return nil, fmt.Errorf("invalid current key path: %w", err)
+    }
+    targetPath, err := hdpath.Parse(path)
+    if err != nil {
+        return nil, fmt.Errorf("invalid target key path: %w", err)
+    }
+    indexes := targetPath.IndexesFrom(currentPath)
+    for _, index := range indexes {
+        var err error
+        var modifier uint32
+        if index.Hardened {
+            modifier = hdkeychain.HardenedKeyStart
+        }
+        key, err = key.Derive(index.Index | modifier)
+        if err != nil {
+            return nil, err
+        }
+    }
+    return key, nil
+}
+```
+
+## Submarine Swap Flow (Sending Lightning)
+
+### Step-by-Step Process
+
+1. **User scans Lightning invoice**
+2. **App requests submarine swap** from Muun server
+3. **Server provides swap parameters:**
+   - Funding output address
+   - Payment hash from invoice
+   - Server's public key
+   - Expiration time
+   - Fee estimates
+
+4. **App validates swap parameters**
+5. **App creates and signs funding transaction**
+6. **Server broadcasts funding transaction**
+7. **Once confirmed, server pays Lightning invoice**
+8. **Server obtains preimage from Lightning network**
+9. **Payment complete**
+
+### Validation
+
+```go
+// Source: libwallet/swaps/swaps.go:79-96
+func (swap *SubmarineSwap) Validate(
+    rawInvoice string,
+    userPublicKey *KeyDescriptor,
+    muunPublicKey *KeyDescriptor,
+    originalExpirationInBlocks int64,
+    network *chaincfg.Params,
+) error {
+    
+    version := swap.FundingOutput.ScriptVersion
+    switch version {
+    case addresses.SubmarineSwapV1:
+        return swap.validateV1(rawInvoice, userPublicKey, 
+            muunPublicKey, network)
+    case addresses.SubmarineSwapV2:
+        return swap.validateV2(rawInvoice, userPublicKey, 
+            muunPublicKey, originalExpirationInBlocks, network)
+    default:
+        return fmt.Errorf("unknown swap version %v", version)
+    }
+}
+```
+
+### Refund Path
+
+If the Lightning payment fails, the user can reclaim funds after expiry:
+
+- **Before expiry**: Only server can spend (to pay Lightning invoice)
+- **After expiry**: User can reclaim funds using their key
+
+This ensures **trustless operation** - the server cannot steal funds, and the user always has a recovery path.
+
+## Incoming Swap Flow (Receiving Lightning)
+
+### Step-by-Step Process
+
+1. **User requests invoice** to receive Lightning payment
+2. **Muun generates Lightning invoice** with unique payment hash
+3. **Sender pays invoice** through Lightning Network
+4. **Muun's swap server receives** Lightning payment
+5. **Server creates HTLC** on-chain, locked with payment hash
+6. **App verifies HTLC parameters:**
+   - Amount matches invoice
+   - Payment hash is correct
+   - Sphinx packet is valid
+   - Script allows spending with preimage
+
+7. **App creates fulfillment transaction**
+8. **App signs with user's key** (Muun adds their signature)
+9. **App reveals preimage** to unlock HTLC
+10. **Funds added to on-chain balance**
+
+### Data Structure
+
+```go
+// Source: libwallet/incoming_swap.go:22-50
+type IncomingSwap struct {
+    Htlc             *IncomingSwapHtlc
+    SphinxPacket     []byte
+    PaymentHash      []byte
+    PaymentAmountSat int64
+    CollectSat       int64
+}
+
+type IncomingSwapHtlc struct {
+    HtlcTx              []byte
+    ExpirationHeight    int64
+    SwapServerPublicKey []byte
+}
+
+type IncomingSwapFulfillmentData struct {
+    FulfillmentTx      []byte
+    MuunSignature      []byte
+    OutputVersion      int
+    OutputPath         string
+    MerkleTree         []byte
+    HtlcBlock          []byte
+    BlockHeight        int64
+    ConfirmationTarget int64
+}
+
+type IncomingSwapFulfillmentResult struct {
+    FulfillmentTx []byte
+    Preimage      []byte
+}
+```
+
+### Verification
+
+```go
+// Source: libwallet/incoming_swap.go:62-115
+func (s *IncomingSwap) VerifyFulfillable(userKey *HDPrivateKey, 
+                                         net *Network) error {
+    paymentHash := s.PaymentHash
+    
+    if len(paymentHash) != 32 {
+        return fmt.Errorf("VerifyFulfillable: received invalid hash len %v", 
+            len(paymentHash))
+    }
+    
+    // Lookup invoice data matching this HTLC using the payment hash
+    invoice, err := s.getInvoice()
+    if err != nil {
+        return fmt.Errorf("VerifyFulfillable: could not find invoice: %w", err)
+    }
+    
+    parentPath, err := hdpath.Parse(invoice.KeyPath)
+    if err != nil {
+        return fmt.Errorf("VerifyFulfillable: invoice key path invalid: %v", 
+            invoice.KeyPath)
+    }
+    identityKeyPath := parentPath.Child(identityKeyChildIndex)
+    
+    // Derive identity key for sphinx validation
+    nodeHDKey, err := userKey.DeriveTo(identityKeyPath.String())
+    if err != nil {
+        return fmt.Errorf("VerifyFulfillable: failed to derive key: %w", err)
+    }
+    nodeKey, err := nodeHDKey.key.ECPrivKey()
+    if err != nil {
+        return fmt.Errorf("VerifyFulfillable: failed to get priv key: %w", err)
+    }
+    
+    // Verify payment amount
+    if invoice.AmountSat != 0 && invoice.AmountSat > s.PaymentAmountSat {
+        return fmt.Errorf("VerifyFulfillable: payment amount (%v) does not match invoice (%v)",
+            s.PaymentAmountSat, invoice.AmountSat)
+    }
+    
+    if len(s.SphinxPacket) == 0 {
+        return nil
+    }
+    
+    // Cryptographically validate sphinx packet
+    err = sphinx.Validate(
+        s.SphinxPacket,
+        paymentHash,
+        invoice.PaymentSecret,
+        nodeKey,
+        0,
+        lnwire.MilliSatoshi(uint64(s.PaymentAmountSat)*1000),
+        net.network,
+    )
+    if err != nil {
+        return fmt.Errorf("VerifyFulfillable: invalid sphinx: %w", err)
+    }
+    
+    return nil
+}
+```
+
+<Warning>
+**Critical**: The app must verify all parameters before revealing the preimage. Revealing the preimage allows the swap server to claim the Lightning payment, so verification ensures you actually receive your on-chain funds.
+</Warning>
+
+### Fulfillment
+
+```go
+// Source: libwallet/incoming_swap.go:117-181
+func (s *IncomingSwap) Fulfill(
+    data *IncomingSwapFulfillmentData,
+    userKey *HDPrivateKey, muunKey *HDPublicKey,
+    net *Network) (*IncomingSwapFulfillmentResult, error) {
+    
+    if s.Htlc == nil {
+        return nil, fmt.Errorf("Fulfill: missing swap htlc data")
+    }
+    
+    err := s.VerifyFulfillable(userKey, net)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Validate the fullfillment tx proposed by Muun
+    tx := wire.MsgTx{}
+    err = tx.DeserializeNoWitness(bytes.NewReader(data.FulfillmentTx))
+    if err != nil {
+        return nil, fmt.Errorf("Fulfill: could not deserialize tx: %w", err)
+    }
+    if len(tx.TxIn) != 1 {
+        return nil, fmt.Errorf("Fulfill: expected exactly 1 input, found %d", 
+            len(tx.TxIn))
+    }
+    if len(tx.TxOut) != 1 {
+        return nil, fmt.Errorf("Fulfill: expected exactly 1 output, found %d", 
+            len(tx.TxOut))
+    }
+    
+    // Lookup invoice data
+    invoice, err := s.getInvoice()
+    if err != nil {
+        return nil, fmt.Errorf("Fulfill: could not find invoice: %w", err)
+    }
+    
+    // Sign the htlc input
+    coin := coinIncomingSwap{
+        Network:             net.network,
+        MuunSignature:       data.MuunSignature,
+        Sphinx:              s.SphinxPacket,
+        HtlcTx:              s.Htlc.HtlcTx,
+        PaymentHash256:      s.PaymentHash,
+        SwapServerPublicKey: s.Htlc.SwapServerPublicKey,
+        ExpirationHeight:    s.Htlc.ExpirationHeight,
+        VerifyOutputAmount:  true,
+        Collect:             btcutil.Amount(s.CollectSat),
+    }
+    err = coin.SignInput(0, &tx, userKey, muunKey)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Serialize signed fulfillment tx
+    var buf bytes.Buffer
+    err = tx.Serialize(&buf)
+    if err != nil {
+        return nil, fmt.Errorf("Fulfill: could not serialize tx: %w", err)
+    }
+    return &IncomingSwapFulfillmentResult{
+        FulfillmentTx: buf.Bytes(),
+        Preimage:      invoice.Preimage,
+    }, nil
+}
+```
+
+## HTLC Script Details
+
+The HTLC script enables atomic swaps:
+
+```go
+// Source: libwallet/incoming_swap.go:478-501
+func createHtlcScript(userPublicKey, muunPublicKey, 
+                      swapServerPublicKey []byte, 
+                      expiry int64, paymentHash []byte) ([]byte, error) {
+    sb := txscript.NewScriptBuilder()
+    
+    // Primary spending path: Muun co-signs
+    sb.AddData(muunPublicKey)
+    sb.AddOp(txscript.OP_CHECKSIG)
+    sb.AddOp(txscript.OP_NOTIF)
+        // Refund path: swap server after expiry
+        sb.AddOp(txscript.OP_DUP)
+        sb.AddOp(txscript.OP_HASH160)
+        sb.AddData(btcutil.Hash160(swapServerPublicKey))
+        sb.AddOp(txscript.OP_EQUALVERIFY)
+        sb.AddOp(txscript.OP_CHECKSIGVERIFY)
+        sb.AddInt64(expiry)
+        sb.AddOp(txscript.OP_CHECKLOCKTIMEVERIFY)
+    sb.AddOp(txscript.OP_ELSE)
+        // Success path: user + preimage
+        sb.AddData(userPublicKey)
+        sb.AddOp(txscript.OP_CHECKSIGVERIFY)
+        sb.AddOp(txscript.OP_SIZE)
+        sb.AddInt64(32)
+        sb.AddOp(txscript.OP_EQUALVERIFY)
+        sb.AddOp(txscript.OP_HASH160)
+        sb.AddData(ripemd160(paymentHash))
+        sb.AddOp(txscript.OP_EQUAL)
+    sb.AddOp(txscript.OP_ENDIF)
+    
+    return sb.Script()
+}
+```
+
+### Script Paths
+
+The HTLC can be spent via three paths:
+
+<Accordion title="Path 1: Success (User + Muun + Preimage)">
+**Used when**: User successfully receives Lightning payment
+
+**Requirements**:
+- User's signature
+- Muun's signature  
+- Valid 32-byte preimage that hashes to payment hash
+
+**Result**: Funds go to user's wallet
+</Accordion>
+
+<Accordion title="Path 2: Refund (Swap Server after expiry)">
+**Used when**: Lightning payment failed and HTLC expired
+
+**Requirements**:
+- Swap server's signature
+- Current block height > expiry height
+
+**Result**: Funds returned to swap server
+</Accordion>
+
+<Accordion title="Path 3: Collaborative Recovery">
+**Used when**: User lost preimage but payment was made
+
+**Requirements**:
+- User provides proof to Muun
+- Muun provides preimage from backend records
+- User and Muun sign together
+
+**Result**: Funds recovered to user's wallet
+</Accordion>
+
+## Fee Structure
+
+### Submarine Swap Fees (Outgoing)
+
+```swift
+// Source: falcon/app/falcon/core/Domain/Model/Operations/SubmarineSwap.swift:102-118
+public class SubmarineSwapFees: NSObject {
+    public let _lightning: Satoshis      // Lightning routing fee
+    public let _sweep: Satoshis          // Sweep into Lightning
+    public let _channelOpen: Satoshis    // Opening channel if needed
+    public let _channelClose: Satoshis   // Closing channel if needed
+    
+    public func total() -> Satoshis {
+        return _lightning + _sweep + _channelOpen + _channelClose
+    }
+}
+```
+
+### Incoming Swap Fees
+
+For incoming swaps, fees are typically subsidized by Muun to improve UX:
+
+```swift
+// Source: falcon/app/falcon/core/Domain/Model/IncomingSwap/IncomingSwap.swift:69-88
+public struct IncomingSwapHtlc {
+    let fulfillmentFeeSubsidyInSats: Satoshis  // Muun subsidy
+    let lentInSats: Satoshis                   // Amount lent by Muun
+    // ...
+}
+```
+
+## Debt Collection
+
+Muun can lend funds to users for submarine swaps, creating **debt** that's collected from future incoming payments:
+
+```swift
+// Source: falcon/app/falcon/core/Domain/Model/Operations/SubmarineSwap.swift:151-152
+public let _debtType: DebtType?
+public let _debtAmount: Satoshis?
+```
+
+```swift
+// Source: falcon/app/falcon/core/Domain/Model/Operations/SubmarineSwap.swift:279-302
+public class SwapExecutionParameters: NSObject {
+    public let sweepFee: Satoshis
+    public let routingFee: Satoshis
+    public let debtType: DebtType
+    public let debtAmount: Satoshis
+    public let confirmationsNeeded: UInt
+    
+    public var offchainFee: Satoshis {
+        return routingFee + sweepFee
+    }
+}
+```
+
+<Info>
+**Debt Types:**
+- `LEND`: Muun lends funds for this swap
+- `COLLECT`: Collecting existing debt from user
+- `NONE`: No debt involved
+</Info>
+
+## Security Properties
+
+### Atomicity
+
+<CardGroup cols={2}>
+  <Card title="All or Nothing" icon="atom">
+    HTLCs ensure swaps either complete fully or refund completely
+  </Card>
+  <Card title="Trustless" icon="shield">
+    Neither party can steal funds due to cryptographic constraints
+  </Card>
+  <Card title="Time-Bounded" icon="clock">
+    Expiry ensures funds aren't locked forever
+  </Card>
+  <Card title="Verifiable" icon="magnifying-glass">
+    All parameters can be verified before committing
+  </Card>
+</CardGroup>
+
+### What Could Go Wrong?
+
+| Scenario | Protection |
+|----------|------------|
+| **Server disappears** | User can refund after expiry |
+| **User reveals preimage early** | HTLC script requires signatures too |
+| **Lightning payment fails** | Submarine swap refunds to user |
+| **HTLC expires** | Swap server can reclaim and refund Lightning |
+| **Muun provides wrong preimage** | User verifies before signing |
+
+## Sphinx Packet Validation
+
+The **sphinx packet** provides cryptographic proof the Lightning payment is legitimate:
+
+```go
+// Source: libwallet/incoming_swap.go:349-362
+err = sphinx.Validate(
+    c.Sphinx,
+    c.PaymentHash256,
+    secrets.PaymentSecret,
+    nodeKey,
+    uint32(c.ExpirationHeight),
+    expectedAmount,
+    c.Network,
+)
+if err != nil {
+    return fmt.Errorf("could not verify sphinx blob: %w", err)
+}
+```
+
+Sphinx packets prove:
+
+- Payment was routed through Lightning Network
+- Amount is correct
+- Payment secret matches
+- Expiry is acceptable
+
+<Warning>
+**Never skip sphinx validation!** Without it, a malicious swap server could create fake HTLCs and steal funds when you reveal the preimage.
+</Warning>
+
+## Swift Integration
+
+```swift
+// Source: falcon/app/falcon/core/Domain/Model/IncomingSwap/IncomingSwap.swift:43-60
+func fulfill(_ data: IncomingSwapFulfillmentData,
+             userKey: WalletPrivateKey,
+             muunKey: WalletPublicKey) throws -> IncomingSwapFulfillmentResult {
+    
+    let result = try toLibwallet().fulfill(
+        data.toLibwallet(),
+        userKey: userKey.key,
+        muunKey: muunKey.key,
+        net: Environment.current.network
+    )
+    
+    preimage = result.preimage
+    
+    return IncomingSwapFulfillmentResult(
+        fullfillmentTx: result.fulfillmentTx!,
+        preimage: result.preimage!
+    )
+}
+```
+
+## Best Practices
+
+### For Users
+
+✅ Understand that Lightning payments involve swap fees  
+✅ Wait for confirmations before considering large payments final  
+✅ Monitor debt accumulation if using lending features  
+
+### For Developers
+
+✅ **Always validate** swap parameters before signing  
+✅ **Verify sphinx packets** for incoming swaps  
+✅ **Check expiry times** are reasonable  
+✅ **Test edge cases**: expiry, failure, refund paths  
+✅ **Never reveal preimage** before verification  
+
+### For Auditors
+
+🔍 Review HTLC script generation in `incoming_swap.go:478-501`  
+🔍 Check sphinx validation is never skipped  
+🔍 Verify signature verification before preimage reveal  
+🔍 Test time lock enforcement  
+🔍 Confirm refund paths work correctly  
+
+## Learn More
+
+<CardGroup cols={3}>
+  <Card title="Architecture" href="/concepts/architecture">
+    Overall system design
+  </Card>
+  <Card title="Multisig Security" href="/concepts/multisig-security">
+    2-of-2 signature scheme
+  </Card>
+  <Card title="Lightning Network" href="/concepts/lightning-network">
+    Lightning integration overview
+  </Card>
+</CardGroup>

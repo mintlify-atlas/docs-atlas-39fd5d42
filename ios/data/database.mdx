@@ -1,0 +1,609 @@
+---
+title: Database
+description: GRDB database implementation and schema management in Muun iOS app
+---
+
+## Overview
+
+The Muun iOS app uses [GRDB](https://github.com/groue/GRDB.swift) - a SQLite toolkit for Swift - as its local database. GRDB provides type-safe database access, reactive queries, and migration support.
+
+## Database Stack
+
+<Tabs>
+  <Tab title="GRDB">
+    - SQLite wrapper with Swift API
+    - Type-safe query builder
+    - Reactive extensions (RxGRDB)
+    - Database migrations
+    - Value observations
+  </Tab>
+  <Tab title="RxGRDB">
+    - Reactive database observations
+    - Observable queries
+    - Automatic change tracking
+    - Integration with RxSwift
+  </Tab>
+</Tabs>
+
+## DatabaseCoordinator
+
+The `DatabaseCoordinator` manages database lifecycle and migrations:
+
+```swift
+public class DatabaseCoordinator {
+    
+    public let queue: DatabaseQueue
+    let preferences: Preferences
+    let secureStorage: SecureStorage
+    let walletService: WalletService
+    
+    public init(queue: DatabaseQueue,
+                preferences: Preferences,
+                secureStorage: SecureStorage,
+                walletService: WalletService) throws {
+        self.queue = queue
+        self.preferences = preferences
+        self.secureStorage = secureStorage
+        self.walletService = walletService
+    }
+    
+    public func migrate() {
+        do {
+            try buildSchema().migrate(queue)
+        } catch {
+            Logger.fatal("Failed to migrate database schema: \(error.localizedDescription)")
+        }
+    }
+    
+    func wipeAll() throws {
+        try queue.erase()
+        try migrate()
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Database/DatabaseCoordinator.swift:14`
+
+## Database Schema
+
+### Core Tables
+
+<Tabs>
+  <Tab title="Operations">
+    ```swift
+migrator.registerMigration("operations") { db in
+    try db.create(table: "publicProfileDB", body: { t in
+        t.column("id", .integer).primaryKey()
+        t.column("firstName", .text).notNull()
+        t.column("lastName", .text).notNull()
+        t.column("profilePictureUrl", .text)
+    })
+    
+    try db.create(table: "operationDB", body: { t in
+        t.column("id", .integer).primaryKey()
+        t.column("direction", .text).notNull()
+        t.column("isExternal", .boolean).notNull()
+        
+        t.column("senderProfileId", .integer)
+            .references("publicProfileDB", onDelete: .setNull)
+        t.column("receiverProfileId", .integer)
+            .references("publicProfileDB", onDelete: .setNull)
+        
+        t.column("amountInSatoshis", .integer).notNull()
+        t.column("feeInSatoshis", .integer).notNull()
+        
+        t.column("confirmations", .integer)
+        t.column("hashDB", .text)
+        t.column("status", .text).notNull()
+        t.column("creationDate", .date).notNull()
+        t.column("exchangeRateWindowHid", .integer).notNull()
+    })
+}
+    ```
+  </Tab>
+  <Tab title="Submarine Swaps">
+    ```swift
+migrator.registerMigration("swaps") { db in
+    try db.create(table: "submarineSwapDB", body: { t in
+        t.column("swapUuid", .text).primaryKey()
+        t.column("invoice", .text).notNull()
+        
+        t.column("sweepFee", .integer).notNull()
+        t.column("lightningFee", .integer).notNull()
+        
+        t.column("expiredAt", .date).notNull()
+        t.column("payedAt", .date)
+        t.column("preimageInHex", .text)
+        
+        t.column("outputAddress", .text).notNull()
+        t.column("outputAmount", .integer).notNull()
+        t.column("confirmationsNeeded", .integer).notNull()
+        
+        t.column("userRefundAddress", .text).notNull()
+        t.column("serverPaymentHashInHex", .text).notNull()
+        t.column("serverPublicKeyInHex", .text).notNull()
+    })
+    
+    try db.alter(table: "operationDB", body: { t in
+        t.add(column: "swapUuid", .text)
+            .references("submarineSwapDB", onDelete: .setNull)
+    })
+}
+    ```
+  </Tab>
+  <Tab title="Incoming Swaps">
+    ```swift
+migrator.registerMigration("incoming swaps") { db in
+    try db.create(table: "incomingSwapDB", body: { table in
+        table.column("uuid", .text)
+            .notNull()
+            .primaryKey()
+        
+        table.column("paymentHashHex", .text)
+            .notNull()
+        
+        table.column("sphinxPacketHex", .text)
+    })
+    
+    try db.create(table: "incomingSwapHtlcDB", body: { table in
+        table.column("uuid", .text)
+            .notNull()
+            .primaryKey()
+        
+        table.column("incomingSwapUuid", .text)
+            .notNull()
+            .indexed()
+            .references("incomingSwapDB", column: "uuid", onDelete: .cascade)
+        
+        table.column("expirationHeight", .integer)
+            .notNull()
+        
+        table.column("outputAmountInSatoshis", .integer)
+            .notNull()
+        
+        table.column("address", .text)
+            .notNull()
+        
+        table.column("swapServerPublicKeyHex", .text)
+            .notNull()
+        
+        table.column("htlcTxHex", .text)
+            .notNull()
+        
+        table.column("fulfillmentTxHex", .text)
+    })
+    
+    try db.alter(table: "operationDB") { table in
+        table.add(column: "incomingSwapUuid", .text)
+            .references("incomingSwapDB", onDelete: .setNull)
+    }
+}
+    ```
+  </Tab>
+</Tabs>
+
+## Database Models
+
+### Protocol Definition
+
+```swift
+typealias DatabaseModel = PersistableRecord & FetchableRecord & DatabaseModelConvertible
+
+protocol DatabaseModelConvertible {
+    associatedtype Model
+    associatedtype PrimaryKeyType: DatabaseValueConvertible
+    
+    init(from: Model)
+    func to(using: Database) throws -> Model
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Repository/BaseDatabaseRepository.swift:14`
+
+### Example: OperationDB
+
+<CodeGroup>
+```swift OperationDB Definition
+struct OperationDB: Codable, FetchableRecord, PersistableRecord {
+    var id: Int
+    var direction: String
+    var isExternal: Bool
+    var status: String
+    var amountInSatoshis: Int
+    var feeInSatoshis: Int
+    var creationDate: Date
+    var hashDB: String?
+    var confirmations: Int?
+    var swapUuid: String?
+    var incomingSwapUuid: String?
+    
+    static let databaseTableName = "operationDB"
+    
+    // Foreign key associations
+    static let submarineSwap = belongsTo(SubmarineSwapDB.self)
+    static let incomingSwap = belongsTo(IncomingSwapDB.self)
+    static let senderProfile = belongsTo(PublicProfileDB.self)
+    static let receiverProfile = belongsTo(PublicProfileDB.self)
+}
+```
+
+```swift Model Conversion
+extension OperationDB: DatabaseModelConvertible {
+    typealias Model = Operation
+    typealias PrimaryKeyType = Int
+    
+    init(from operation: Operation) {
+        self.id = operation.id ?? 0
+        self.direction = operation.direction.rawValue
+        self.isExternal = operation.isExternal
+        self.status = operation.status.rawValue
+        self.amountInSatoshis = operation.amount.inSatoshis.value
+        self.feeInSatoshis = operation.fee.inSatoshis.value
+        self.creationDate = operation.creationDate
+        self.hashDB = operation.transaction?.hash
+        self.confirmations = operation.confirmations
+        self.swapUuid = operation.submarineSwap?.swapUuid
+        self.incomingSwapUuid = operation.incomingSwap?.uuid
+    }
+    
+    func to(using db: Database) throws -> Operation {
+        // Fetch related entities
+        let submarineSwap = try self.submarineSwap
+            .fetchOne(db)?
+            .to(using: db)
+        
+        let incomingSwap = try self.incomingSwap
+            .fetchOne(db)?
+            .to(using: db)
+        
+        return Operation(
+            id: id,
+            direction: OperationDirection(rawValue: direction)!,
+            isExternal: isExternal,
+            status: OperationStatus(rawValue: status)!,
+            amount: BitcoinAmount(inSatoshis: Satoshis(value: amountInSatoshis)),
+            fee: BitcoinAmount(inSatoshis: Satoshis(value: feeInSatoshis)),
+            creationDate: creationDate,
+            confirmations: confirmations,
+            submarineSwap: submarineSwap,
+            incomingSwap: incomingSwap
+        )
+    }
+}
+```
+</CodeGroup>
+
+## Migrations
+
+Migrations are registered and executed sequentially:
+
+```swift
+private func buildSchema() -> DatabaseMigrator {
+    var migrator = DatabaseMigrator()
+    
+    // Initial schema
+    migrator.registerMigration("operations") { db in
+        try db.create(table: "operationDB") { t in
+            // Table definition
+        }
+    }
+    
+    // Add new column
+    migrator.registerMigration("add rbf column to operations db") { db in
+        try db.alter(table: "operationDB", body: { t in
+            t.add(column: "isReplaceableByFee", .boolean)
+                .defaults(to: false)
+                .notNull()
+        })
+    }
+    
+    // Data migration
+    migrator.registerMigration("update incoming swaps to allow collects") { db in
+        // Add new columns
+        try db.alter(table: "incomingSwapDB", body: { t in
+            t.add(column: "paymentAmountInSats", .numeric)
+                .defaults(to: 0)
+                .notNull()
+        })
+        
+        // Migrate existing data
+        try Row.fetchAll(db, sql: "SELECT uuid, amount FROM incomingSwapHtlcDB")
+            .forEach { row in
+                try db.execute(sql: """
+                    UPDATE incomingSwapDb
+                    SET paymentAmountInSats = :amount
+                    WHERE uuid = :uuid
+                """, arguments: [
+                    "amount": row["amount"],
+                    "uuid": row["uuid"]
+                ])
+            }
+    }
+    
+    // Preferences migration
+    migrator.registerMigration("move isBalanceHidden to libwallet storage") { _ in
+        let isBalanceHidden = self.preferences.bool(forKey: .isBalanceHidden)
+        self.walletService.saveBool(key: "isBalanceHidden", value: isBalanceHidden)
+        self.preferences.remove(key: .isBalanceHidden)
+    }
+    
+    return migrator
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Data/Database/DatabaseCoordinator.swift:40`
+
+### Migration Best Practices
+
+<AccordionGroup>
+  <Accordion title="Sequential Execution">
+    Migrations run in order of registration. Each migration runs exactly once.
+  </Accordion>
+
+  <Accordion title="Data Preservation">
+    When altering schemas, preserve existing data or migrate it explicitly.
+  </Accordion>
+
+  <Accordion title="Default Values">
+    Always provide defaults when adding non-nullable columns to existing tables.
+  </Accordion>
+
+  <Accordion title="Cross-Layer Migrations">
+    Migrations can access Preferences, SecureStorage, and other services to migrate data across storage systems.
+  </Accordion>
+</AccordionGroup>
+
+## Reactive Queries
+
+### Value Observation
+
+Track specific values that change:
+
+```swift
+func watchOperationsChange() -> Observable<OperationsChange> {
+    return ValueObservation.tracking(OperationDB.all()) { db in
+        let count = try OperationDB.fetchCount(db)
+        let latest = try OperationDB
+            .order(Column("creationDate").desc)
+            .limit(1)
+            .fetchOne(db)?
+            .to(using: db)
+        
+        return OperationsChange(
+            numberOfOperations: count,
+            lastOperation: latest
+        )
+    }.rx.observe(in: queue)
+}
+```
+
+### Region Observation
+
+Observe changes to entire table regions:
+
+```swift
+func watchObjects() -> Observable<[M]> {
+    return T.all()
+        .rx
+        .observeAll(in: queue)
+        .map({ [weak self] objects in
+            guard let self = self else {
+                throw MuunError(Errors.readFailed)
+            }
+            
+            return try self.queue.read { db in
+                try objects.map({ try $0.to(using: db) })
+            }
+        })
+}
+```
+
+### Single Object Observation
+
+```swift
+func watchObject(with id: T.PrimaryKeyType) -> Observable<M> {
+    return T.filter(key: id)
+        .rx
+        .observeFirst(in: queue)
+        .map({ [weak self] object in
+            guard let self = self,
+                let object = object else {
+                throw MuunError(Errors.readFailed)
+            }
+            
+            return try self.queue.read { db in
+                try object.to(using: db)
+            }
+        })
+}
+```
+
+## Query Interface
+
+### Basic Queries
+
+<CodeGroup>
+```swift Filter
+let query = OperationDB
+    .filter(Column("status") == "PENDING")
+
+let results = try query.fetchAll(db)
+```
+
+```swift Order
+let query = OperationDB
+    .order(Column("creationDate").desc)
+
+let operations = try query.fetchAll(db)
+```
+
+```swift Limit
+let query = OperationDB
+    .limit(50, offset: 0)
+
+let page = try query.fetchAll(db)
+```
+
+```swift Multiple Conditions
+let query = OperationDB
+    .filter(Column("status") == "CONFIRMED")
+    .filter(Column("amount") > 100000)
+    .order(Column("creationDate").desc)
+    .limit(10)
+```
+</CodeGroup>
+
+### Joins
+
+```swift
+// Join with submarine swaps
+let query = OperationDB
+    .joining(required: OperationDB.submarineSwap)
+    .filter(Column("status") == "SWAP_PENDING")
+
+// Join with profiles
+let query = OperationDB
+    .including(optional: OperationDB.senderProfile)
+    .including(optional: OperationDB.receiverProfile)
+```
+
+### Aggregations
+
+```swift
+// Count
+let count = try OperationDB.fetchCount(db)
+
+// Filtered count
+let pendingCount = try OperationDB
+    .filter(Column("status") == "PENDING")
+    .fetchCount(db)
+
+// Exists
+let hasPending = try OperationDB
+    .filter(Column("status") == "PENDING")
+    .limit(1)
+    .fetchOne(db) != nil
+```
+
+## Database Operations
+
+### Write Operations
+
+<CodeGroup>
+```swift Insert
+try db.write { db in
+    let operation = OperationDB(from: domainOperation)
+    try operation.insert(db)
+}
+```
+
+```swift Update
+try db.write { db in
+    var operation = try OperationDB.fetchOne(db, key: id)
+    operation?.status = "CONFIRMED"
+    try operation?.update(db)
+}
+```
+
+```swift Save (Insert or Update)
+try db.write { db in
+    let operation = OperationDB(from: domainOperation)
+    try operation.save(db) // Inserts or updates
+}
+```
+
+```swift Delete
+try db.write { db in
+    try OperationDB.deleteOne(db, key: id)
+}
+```
+</CodeGroup>
+
+### Transactions
+
+```swift
+try queue.write { db in
+    // All operations in a transaction
+    try operation.save(db)
+    try profile.save(db)
+    try swap.save(db)
+    
+    // If any fails, all are rolled back
+}
+```
+
+## Performance Optimization
+
+### Indexing
+
+```swift
+try db.create(table: "operationDB") { t in
+    t.column("id", .integer).primaryKey()
+    t.column("status", .text).notNull().indexed()
+    t.column("creationDate", .date).notNull().indexed()
+}
+```
+
+### Batch Operations
+
+```swift
+func write(objects: [M]) -> Completable {
+    return Completable.deferred({
+        try self.queue.write { (db) in
+            for object in objects {
+                try T(from: object).save(db)
+            }
+        }
+        return Completable.empty()
+    })
+}
+```
+
+### Lazy Loading
+
+```swift
+return LazyLoadedList<Operation>(
+    total: try OperationDB.fetchCount(db),
+    initialElements: try query.limit(50).fetchAll(db),
+    onLoadMore: { (limit: Int, offset: Int) in
+        return self.objects(query: query.limit(limit, offset: offset)) ?? []
+    }
+)
+```
+
+## Error Handling
+
+```swift
+func object(query: QueryInterfaceRequest<T>) -> M? {
+    return queue.read { db in
+        do {
+            return try query.fetchOne(db)?.to(using: db)
+        } catch {
+            Logger.log(error: error)
+            return nil
+        }
+    }
+}
+
+func count() -> Int {
+    return queue.read { db in
+        do {
+            return try T.fetchCount(db)
+        } catch {
+            Logger.log(error: error)
+            return 0
+        }
+    }
+}
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Repositories" icon="box" href="/ios/data/repositories">
+    Repository pattern using GRDB
+  </Card>
+  <Card title="Domain Models" icon="cube" href="/ios/domain/models">
+    Domain models mapped to database
+  </Card>
+</CardGroup>

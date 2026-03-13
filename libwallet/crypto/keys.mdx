@@ -1,0 +1,614 @@
+---
+title: 'HD Key Derivation'
+description: 'Hierarchical Deterministic key management in Muun Wallet'
+---
+
+## Overview
+
+Muun uses BIP32 Hierarchical Deterministic (HD) key derivation to generate all wallet keys from a single seed. This allows deterministic key generation and backup/recovery.
+
+## HD Key Types
+
+### HDPrivateKey
+
+```go
+type HDPrivateKey struct {
+    key     hdkeychain.ExtendedKey
+    Network *Network
+    Path    string
+}
+```
+
+### HDPublicKey
+
+```go
+type HDPublicKey struct {
+    key     hdkeychain.ExtendedKey
+    Network *Network
+    Path    string
+}
+```
+
+## Key Generation
+
+### From Seed
+
+Generate master key from seed bytes:
+
+<CodeGroup>
+
+```go Go
+func NewHDPrivateKeyFromSeed(
+    seed []byte,
+    network *Network,
+) (*HDPrivateKey, error) {
+    key, err := hdkeychain.NewMaster(seed, network.network)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &HDPrivateKey{
+        key:     *key,
+        Network: network,
+        Path:    "m",
+    }, nil
+}
+```
+
+```swift iOS
+let seed = Data(/* 64 bytes from mnemonic */)            
+let network = try! LibwalletNewNetwork("mainnet")
+
+let masterKey = try! LibwalletNewHDPrivateKeyFromSeed(
+    seed,
+    network
+)
+
+print("Master key path: \(masterKey.path())")
+```
+
+</CodeGroup>
+
+### From Recovery Code
+
+```swift
+let recoveryCode = "ABCD-EFGH-IJKL-MNOP"
+let salt = "muun"
+
+let challengeKey = try! LibwalletRecoveryCodeToKey(
+    recoveryCode,
+    salt
+)
+
+let privateKey = challengeKey.key
+print("Generated private key from recovery code")
+```
+
+## Key Derivation
+
+### Derive to Path
+
+<Tabs>
+  <Tab title="Go">
+    ```go
+    func (k *HDPrivateKey) DeriveTo(path string) (*HDPrivateKey, error) {
+        currentPath, err := hdpath.Parse(k.Path)
+        if err != nil {
+            return nil, err
+        }
+        
+        targetPath, err := hdpath.Parse(path)
+        if err != nil {
+            return nil, err
+        }
+        
+        indexes := targetPath.IndexesFrom(currentPath)
+        
+        derivedKey := k.key
+        for _, index := range indexes {
+            var modifier uint32
+            if index.Hardened {
+                modifier = hdkeychain.HardenedKeyStart
+            }
+            
+            newKey, err := derivedKey.Derive(index.Index | modifier)
+            if err != nil {
+                return nil, err
+            }
+            derivedKey = *newKey
+        }
+        
+        return &HDPrivateKey{
+            key:     derivedKey,
+            Network: k.Network,
+            Path:    path,
+        }, nil
+    }
+    ```
+  </Tab>
+  
+  <Tab title="Swift">
+    ```swift
+    let masterKey: LibwalletHDPrivateKey = // master key
+    
+    // Derive to specific path
+    let derivedKey = try! masterKey.deriveTo("m/44'/0'/0'/0/0")
+    
+    print("Derived path: \(derivedKey.path())")
+    print("Is hardened: \(derivedKey.path().contains("'"))")
+    ```
+  </Tab>
+</Tabs>
+
+### Hardened vs Non-Hardened
+
+<ParamField path="Hardened Derivation" type="m/44'/0'/0'">
+  Uses parent private key. More secure. Denoted with apostrophe (').
+</ParamField>
+
+<ParamField path="Non-Hardened Derivation" type="m/44'/0'/0'/0/0">
+  Uses parent public key. Allows public key derivation without private key.
+</ParamField>
+
+```swift
+// Hardened (requires private key)
+let accountKey = try! masterKey.deriveTo("m/44'/0'/0'")
+
+// Non-hardened (can derive from public key)
+let addressKey = try! accountKey.publicKey().deriveTo("m/44'/0'/0'/0/0")
+```
+
+## Muun Key Paths
+
+### Schema-Based Paths
+
+Muun uses custom derivation paths:
+
+```swift
+// User base key
+let userBasePath = "m/schema:1'/recovery:1'"
+
+// External addresses (receiving)
+let externalPath = "m/schema:1'/recovery:1'/external:1/0"
+
+// Internal addresses (change)
+let changePath = "m/schema:1'/recovery:1'/change:1/0"
+
+// Contact addresses
+let contactPath = "m/schema:1'/recovery:1'/contacts:1/0"
+```
+
+### Path Components
+
+<ResponseField name="schema" type="int">
+  Schema version for future upgrades
+</ResponseField>
+
+<ResponseField name="recovery" type="int">
+  Recovery code version
+</ResponseField>
+
+<ResponseField name="external" type="int">
+  External chain for receiving addresses
+</ResponseField>
+
+<ResponseField name="change" type="int">
+  Internal chain for change addresses
+</ResponseField>
+
+## Public Key Extraction
+
+### From Private Key
+
+```go
+func (k *HDPrivateKey) PublicKey() (*HDPublicKey, error) {
+    pubKey, err := k.key.Neuter()
+    if err != nil {
+        return nil, err
+    }
+    
+    return &HDPublicKey{
+        key:     *pubKey,
+        Network: k.Network,
+        Path:    k.Path,
+    }, nil
+}
+```
+
+### iOS Usage
+
+```swift
+let privateKey: LibwalletHDPrivateKey = // user's key
+
+let publicKey = try! privateKey.publicKey()
+
+// Can derive child public keys without private key
+let childPubKey = try! publicKey.deriveTo("m/0/0")
+
+print("Public key path: \(childPubKey.path())")
+```
+
+## Key Serialization
+
+### Extended Key Format (xprv/xpub)
+
+<CodeGroup>
+
+```go Go
+func (k *HDPrivateKey) String() string {
+    return k.key.String()
+}
+
+func (k *HDPublicKey) String() string {
+    return k.key.String()
+}
+
+// Parse from string
+func NewHDPrivateKeyFromString(
+    str string,
+    network *Network,
+) (*HDPrivateKey, error) {
+    key, err := hdkeychain.NewKeyFromString(str)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &HDPrivateKey{
+        key:     *key,
+        Network: network,
+        Path:    "m", // Path unknown from serialized key
+    }, nil
+}
+```
+
+```swift iOS
+let privateKey: LibwalletHDPrivateKey = // key
+
+// Serialize to extended private key
+let xprv = privateKey.string()
+print("xprv: \(xprv)")
+// Example: xprv9s21ZrQH143K...
+
+// Serialize public key
+let xpub = try! privateKey.publicKey().string()
+print("xpub: \(xpub)")
+// Example: xpub661MyMwAqRbc...
+
+// Parse from string
+let restoredKey = try! LibwalletNewHDPrivateKeyFromString(
+    xprv,
+    network
+)
+```
+
+</CodeGroup>
+
+## EC Key Extraction
+
+### Get Raw EC Keys
+
+```go
+// Get EC private key
+func (k *HDPrivateKey) ECPrivKey() (*btcec.PrivateKey, error) {
+    return k.key.ECPrivKey()
+}
+
+// Get EC public key
+func (k *HDPublicKey) ECPubKey() (*btcec.PublicKey, error) {
+    return k.key.ECPubKey()
+}
+```
+
+### iOS Example
+
+```swift
+// Get raw keys for signing
+let privateKey: LibwalletHDPrivateKey = // key
+let derivedKey = try! privateKey.deriveTo("m/0/0")
+
+// Extract EC private key for ECDSA signing
+let ecPriv = try! derivedKey.ecPrivKey()
+
+// Extract EC public key
+let publicKey = try! derivedKey.publicKey()
+let ecPub = try! publicKey.ecPubKey()
+
+print("Public key: \(ecPub.serializeCompressed().hexString)")
+```
+
+## Key Fingerprints
+
+### Calculate Fingerprint
+
+Fingerprints identify keys in descriptors:
+
+```swift
+extension HDPublicKey {
+    func fingerprint() -> Data {
+        let pubKey = try! self.ecPubKey()
+        let compressed = pubKey.serializeCompressed()
+        
+        // Hash160 = RIPEMD160(SHA256(pubkey))
+        let sha = SHA256.hash(data: compressed)
+        let ripemd = RIPEMD160.hash(data: sha)
+        
+        // First 4 bytes are the fingerprint
+        return Data(ripemd.prefix(4))
+    }
+    
+    func fingerprintHex() -> String {
+        return fingerprint().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+let pubKey: LibwalletHDPublicKey = // key
+print("Fingerprint: \(pubKey.fingerprintHex())")
+// Example: a1b2c3d4
+```
+
+## Key Descriptor
+
+For submarine swaps and complex scripts:
+
+```go
+type KeyDescriptor struct {
+    Key  *hdkeychain.ExtendedKey
+    Path string
+}
+
+func (d *KeyDescriptor) DeriveTo(path string) (*hdkeychain.ExtendedKey, error) {
+    key := d.Key
+    
+    currentPath, err := hdpath.Parse(d.Path)
+    if err != nil {
+        return nil, fmt.Errorf("invalid current key path: %w", err)
+    }
+    targetPath, err := hdpath.Parse(path)
+    if err != nil {
+        return nil, fmt.Errorf("invalid target key path: %w", err)
+    }
+    
+    indexes := targetPath.IndexesFrom(currentPath)
+    for _, index := range indexes {
+        var modifier uint32
+        if index.Hardened {
+            modifier = hdkeychain.HardenedKeyStart
+        }
+        key, err = key.Derive(index.Index | modifier)
+        if err != nil {
+            return nil, err
+        }
+    }
+    return key, nil
+}
+```
+
+## Security Considerations
+
+<AccordionGroup>
+  <Accordion title="Never Export Private Keys">
+    Private keys should never leave secure storage:
+    ```swift
+    // ❌ WRONG - don't serialize to logs or UI
+    print("Private key: \(privateKey.string())")
+    
+    // ✅ CORRECT - only use in memory
+    let signature = try signTransaction(with: privateKey)
+    // privateKey is cleared when out of scope
+    ```
+  </Accordion>
+  
+  <Accordion title="Use Hardened Derivation for Accounts">
+    Always use hardened paths for account-level keys:
+    ```swift
+    // ✅ CORRECT - hardened account derivation
+    let accountKey = try! masterKey.deriveTo("m/44'/0'/0'")
+    
+    // ❌ WRONG - non-hardened account (security risk)
+    let weakKey = try! masterKey.deriveTo("m/44/0/0")
+    ```
+  </Accordion>
+  
+  <Accordion title="Validate Derivation Paths">
+    Always validate paths before deriving:
+    ```swift
+    func validatePath(_ path: String) throws {
+        guard path.hasPrefix("m/") else {
+            throw KeyError.invalidPath
+        }
+        
+        let components = path.split(separator: "/")
+        guard components.count > 1 else {
+            throw KeyError.invalidPath
+        }
+        
+        // Additional validation...
+    }
+    
+    try validatePath("m/44'/0'/0'/0/0")
+    ```
+  </Accordion>
+  
+  <Accordion title="Secure Seed Storage">
+    Seeds must be encrypted when stored:
+    ```swift
+    import CryptoKit
+    
+    func storeSeed(_ seed: Data, password: String) throws {
+        // Derive encryption key from password
+        let passwordData = password.data(using: .utf8)!
+        let salt = Data.random(count: 32)
+        let key = PBKDF2.deriveKey(
+            password: passwordData,
+            salt: salt,
+            iterations: 100_000,
+            keyLength: 32
+        )
+        
+        // Encrypt seed
+        let encrypted = try AES.GCM.seal(seed, using: key)
+        
+        // Store encrypted seed + salt
+        try Keychain.save(encrypted.combined, forKey: "encrypted_seed")
+        try Keychain.save(salt, forKey: "seed_salt")
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Complete Example
+
+### iOS Key Management
+
+```swift
+class KeyManager {
+    private let network: LibwalletNetwork
+    private var masterKey: LibwalletHDPrivateKey?
+    
+    init(network: String) throws {
+        self.network = try LibwalletNewNetwork(network)
+    }
+    
+    // Initialize from recovery code
+    func initializeFromRecoveryCode(
+        _ recoveryCode: String,
+        salt: String = "muun"
+    ) throws {
+        let challengeKey = try LibwalletRecoveryCodeToKey(
+            recoveryCode,
+            salt
+        )
+        
+        let userBaseKey = try challengeKey.deriveKey(
+            "m/schema:1'/recovery:1'"
+        )
+        
+        self.masterKey = userBaseKey
+    }
+    
+    // Get address key
+    func getAddressKey(
+        chain: AddressChain,
+        index: Int
+    ) throws -> LibwalletHDPrivateKey {
+        guard let master = masterKey else {
+            throw KeyError.noMasterKey
+        }
+        
+        let chainStr = chain == .external ? "external" : "change"
+        let path = "m/schema:1'/recovery:1'/\(chainStr):1/\(index)"
+        
+        return try master.deriveTo(path)
+    }
+    
+    // Get public key for server
+    func getUserPublicKey() throws -> LibwalletHDPublicKey {
+        guard let master = masterKey else {
+            throw KeyError.noMasterKey
+        }
+        
+        return try master.publicKey()
+    }
+    
+    // Cache derived keys
+    private var keyCache: [String: LibwalletHDPrivateKey] = [:]
+    
+    func getCachedKey(path: String) throws -> LibwalletHDPrivateKey {
+        if let cached = keyCache[path] {
+            return cached
+        }
+        
+        guard let master = masterKey else {
+            throw KeyError.noMasterKey
+        }
+        
+        let derived = try master.deriveTo(path)
+        keyCache[path] = derived
+        return derived
+    }
+}
+
+enum AddressChain {
+    case external  // Receiving addresses
+    case change    // Change addresses
+}
+
+enum KeyError: Error {
+    case noMasterKey
+    case invalidPath
+    case derivationFailed
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Cache Derived Keys">
+    Key derivation is expensive. Cache frequently used keys:
+    ```swift
+    class KeyCache {
+        private var cache = NSCache<NSString, LibwalletHDPrivateKey>()
+        
+        func getOrDerive(
+            from base: LibwalletHDPrivateKey,
+            path: String
+        ) throws -> LibwalletHDPrivateKey {
+            let cacheKey = "\(base.path())-\(path)" as NSString
+            
+            if let cached = cache.object(forKey: cacheKey) {
+                return cached
+            }
+            
+            let derived = try base.deriveTo(path)
+            cache.setObject(derived, forKey: cacheKey)
+            return derived
+        }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Use Appropriate Hardening">
+    Follow BIP44 hardening conventions:
+    ```swift
+    // BIP44 standard: m / purpose' / coin_type' / account' / change / address_index
+    
+    // Hardened: purpose, coin_type, account
+    let accountKey = try! master.deriveTo("m/44'/0'/0'")
+    
+    // Non-hardened: change, address_index
+    let addressKey = try! accountKey.deriveTo("m/44'/0'/0'/0/0")
+    ```
+  </Accordion>
+  
+  <Accordion title="Clear Sensitive Data">
+    Explicitly clear sensitive data when done:
+    ```swift
+    func signTransaction(privateKey: LibwalletHDPrivateKey) throws -> Data {
+        defer {
+            // Key will be cleared when out of scope
+            // Explicit cleanup if needed
+        }
+        
+        let signature = try createSignature(privateKey)
+        return signature
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Encryption" icon="lock" href="/libwallet/crypto/encryption">
+    Encrypt data with HD keys
+  </Card>
+  <Card title="MuSig" icon="users" href="/libwallet/crypto/musig">
+    Multi-party key aggregation
+  </Card>
+  <Card title="Address Generation" icon="location-dot" href="/libwallet/addresses">
+    Generate addresses from HD keys
+  </Card>
+  <Card title="Transaction Signing" icon="signature" href="/libwallet/signing">
+    Sign transactions with derived keys
+  </Card>
+</CardGroup>

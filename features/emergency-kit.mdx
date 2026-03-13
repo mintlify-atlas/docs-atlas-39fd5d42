@@ -1,0 +1,162 @@
+---
+title: "Emergency Kit"
+description: "Learn how the Emergency Kit protects your bitcoin by providing offline recovery keys"
+---
+
+## Overview
+
+The Emergency Kit is a critical security feature that provides a PDF document containing encrypted backup keys for recovering your bitcoin. It acts as your ultimate safety net if you lose access to your Muun wallet.
+
+<Note>
+The Emergency Kit should be completed as the final step in your wallet backup process, after setting up email and recovery code.
+</Note>
+
+## How It Works
+
+The Emergency Kit contains two encrypted private keys that work together to secure your funds:
+
+1. **User Key** - Your encrypted private key with its fingerprint
+2. **Muun Key** - Muun's encrypted private key with its fingerprint
+3. **Verification Code** - A unique 6-digit code to verify kit authenticity
+
+### Generation Process
+
+When you create an Emergency Kit, the system:
+
+<Steps>
+  <Step title="Generate encrypted keys">
+    The wallet generates HTML content containing your encrypted keys using the `LibwalletGenerateEmergencyKitHTML` function.
+    
+    ```swift
+    let input = LibwalletEKInput()
+    input.firstEncryptedKey = data.userKey
+    input.firstFingerprint = data.userFingerprint
+    input.secondEncryptedKey = data.muunKey
+    input.secondFingerprint = data.muunFingerprint
+    ```
+  </Step>
+  
+  <Step title="Create verification code">
+    A deterministic 6-digit verification code is generated from your encrypted keys to help verify the kit's authenticity later.
+    
+    ```go
+    // Creates a stable verification code from the Muun key
+    inputMaterial := params.SecondEncryptedKey + strconv.Itoa(params.Version)
+    inputHash := sha256.Sum256([]byte(inputMaterial))
+    ```
+  </Step>
+  
+  <Step title="Generate PDF">
+    The HTML is converted to a PDF with metadata embedded for recovery tools.
+  </Step>
+</Steps>
+
+## Saving Your Emergency Kit
+
+Muun recommends multiple saving options based on your device setup:
+
+### Cloud Storage Options
+
+<Accordion title="Google Drive (Recommended)">
+  If you have Google Drive or Gmail installed, this is the recommended option:
+  
+  - Automatic upload to your Google Drive
+  - Easy access from any device
+  - Shareable link provided after upload
+  
+  ```swift
+  GoogleDriveHelper.uploadEK(
+      googleUser: googleUser,
+      emergencyKitUrl: kit.url,
+      fileName: fileName,
+      user: user,
+      kitVersion: kit.version
+  )
+  ```
+</Accordion>
+
+<Accordion title="iCloud Drive">
+  Available if iCloud is enabled on your device:
+  
+  - Stores in your iCloud Drive
+  - Syncs across Apple devices
+  - Accessible through Files app
+  
+  ```swift
+  // Check iCloud availability
+  FileManager.default.ubiquityIdentityToken != nil
+  ```
+</Accordion>
+
+<Accordion title="Manual Save">
+  For users who prefer local storage:
+  
+  - Save to device storage
+  - Share via other apps
+  - Print physical copy
+</Accordion>
+
+## Verification
+
+After saving your Emergency Kit, you'll be prompted to verify it by entering the 6-digit verification code:
+
+<Warning>
+The verification code is displayed on the Emergency Kit PDF. Keep this code secure and never share it publicly.
+</Warning>
+
+```swift
+func isOld(code: String) -> Bool {
+    return emergencyKitVerificationCodesRepository.isOld(code: code)
+}
+```
+
+## Security Best Practices
+
+<Steps>
+  <Step title="Store securely">
+    Keep your Emergency Kit in a secure location. Consider printing a physical copy and storing it in a safe.
+  </Step>
+  
+  <Step title="Don't share">
+    Never share your Emergency Kit or verification code with anyone. Muun will never ask for this information.
+  </Step>
+  
+  <Step title="Update when needed">
+    Generate a new Emergency Kit if you change your recovery code or if you suspect your old kit may be compromised.
+  </Step>
+  
+  <Step title="Test recovery">
+    Familiarize yourself with the recovery process so you're prepared if you ever need to use it.
+  </Step>
+</Steps>
+
+## Emergency Kit Versions
+
+Emergency Kits are versioned to support improvements over time. The current version includes:
+
+- Encrypted private keys with fingerprints
+- Recovery code checksum
+- Deterministic verification code
+- Localized content (English and Spanish)
+
+<Info>
+The app automatically generates the latest version of the Emergency Kit. Older versions remain compatible with recovery tools.
+</Info>
+
+## Technical Details
+
+The Emergency Kit is generated using Go code in `libwallet/emergencykit/` and integrated into the iOS app:
+
+**Key Components:**
+
+| Component | Purpose |
+|-----------|----------|
+| `EmergencyKit.swift` | iOS wrapper for kit generation |
+| `emergencykit.go` | Core kit generation logic |
+| `ShareEmergencyKitPresenter.swift` | Handles cloud upload and sharing |
+| `ActivateEmergencyKitPresenter.swift` | Manages verification flow |
+
+## Related Features
+
+- [Wallet Recovery](/features/wallet-recovery) - Learn how to use your Emergency Kit
+- [Security Center](/features/security-center) - Complete your security setup

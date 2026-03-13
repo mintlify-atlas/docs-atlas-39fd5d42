@@ -1,0 +1,567 @@
+---
+title: Use Cases
+description: Use case pattern with AsyncAction for business logic execution
+---
+
+## Overview
+
+Use cases in the Muun iOS app are implemented using the `AsyncAction<T>` pattern. Each use case represents a discrete business operation that coordinates between repositories, services, and domain logic.
+
+## AsyncAction Pattern
+
+The `AsyncAction<T>` class provides a reactive pattern for executing asynchronous operations:
+
+```swift
+public class AsyncAction<T>: NSObject {
+    
+    private let name: String
+    private let subject: BehaviorSubject<ActionState<T>>
+    private let scheduler = SerialDispatchQueueScheduler(qos: .background)
+    
+    init(name: String) {
+        self.name = name
+        self.subject = BehaviorSubject(value: ActionState.createEmpty())
+        super.init()
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Action/Base/AsyncAction.swift:11`
+
+### Key Methods
+
+<Tabs>
+  <Tab title="runSingle">
+    ```swift
+func runSingle(_ single: Single<T>) {
+    guard let state = try? subject.value() else {
+        fatalError()
+    }
+    
+    // Prevent duplicate execution
+    if state.type == .LOADING {
+        return
+    }
+    
+    _ = single
+        .observeOn(scheduler)
+        .do(onSuccess: {
+            self.subject.onNext(ActionState.createValue(value: $0))
+        }, onError: {
+            self.subject.onNext(ActionState.createError(error: $0))
+        }, onSubscribe: {
+            self.subject.onNext(ActionState.createLoading())
+        })
+        .subscribeOn(Scheduler.backgroundScheduler)
+        .subscribe()
+}
+    ```
+    Execute a Single operation and emit state changes
+  </Tab>
+  <Tab title="getState">
+    ```swift
+public func getState() -> Observable<ActionState<T>> {
+    return Observable.create({ (observer) -> Disposable in
+        return self.subject
+            .do(onSubscribed: {
+                observer.onNext(ActionState.createEmpty())
+            })
+            .subscribe(onNext: { [weak self] state in
+                switch state.type {
+                case .EMPTY:
+                    break
+                    
+                case .LOADING:
+                    observer.on(.next(state))
+                    
+                case .VALUE, .ERROR:
+                    observer.on(.next(state))
+                    observer.on(.next(ActionState.createEmpty()))
+                    self?.safeSetEmpty()
+                }
+            })
+    })
+}
+    ```
+    Subscribe to action state changes
+  </Tab>
+  <Tab title="getValue">
+    ```swift
+public func getValue() -> Single<T> {
+    return Single.create(subscribe: { (callback) -> Disposable in
+        return self.subject
+            .subscribe(onNext: { [weak self] state in
+                switch state.type {
+                case .EMPTY, .LOADING:
+                    break
+                    
+                case .VALUE:
+                    callback(.success(state.getValue()!))
+                    self?.safeSetEmpty()
+                    
+                case .ERROR:
+                    callback(.error(state.getError()!))
+                    self?.safeSetEmpty()
+                }
+            })
+    })
+}
+    ```
+    Get single result when action completes
+  </Tab>
+  <Tab title="reset">
+    ```swift
+public func reset() {
+    subject.onNext(ActionState.createEmpty())
+}
+    ```
+    Reset action to empty state
+  </Tab>
+</Tabs>
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Action/Base/AsyncAction.swift:24`
+
+### Completable Support
+
+For actions without return values:
+
+```swift
+extension AsyncAction where T == () {
+    
+    func runCompletable(_ completable: Completable) {
+        runSingle(completable.andThen(Single.just(())))
+    }
+}
+```
+
+Source: `~/workspace/source/falcon/app/falcon/core/Domain/Action/Base/AsyncAction.swift:122`
+
+## ActionState
+
+```swift
+public class ActionState<T> {
+    
+    public enum ActionStateType {
+        case EMPTY
+        case LOADING
+        case VALUE
+        case ERROR
+    }
+    
+    let type: ActionStateType
+    private let value: T?
+    private let error: Error?
+    
+    static func createEmpty() -> ActionState<T> {
+        return ActionState(type: .EMPTY, value: nil, error: nil)
+    }
+    
+    static func createLoading() -> ActionState<T> {
+        return ActionState(type: .LOADING, value: nil, error: nil)
+    }
+    
+    static func createValue(value: T) -> ActionState<T> {
+        return ActionState(type: .VALUE, value: value, error: nil)
+    }
+    
+    static func createError(error: Error) -> ActionState<T> {
+        return ActionState(type: .ERROR, value: nil, error: error)
+    }
+    
+    func getValue() -> T? {
+        return value
+    }
+    
+    func getError() -> Error? {
+        return error
+    }
+}
+```
+
+## Use Case Examples
+
+### Fetch Operations
+
+```swift
+class FetchOperationsAction: AsyncAction<[Operation]> {
+    
+    private let operationRepository: OperationRepository
+    private let houstonService: HoustonService
+    
+    init(name: String,
+         operationRepository: OperationRepository,
+         houstonService: HoustonService) {
+        self.operationRepository = operationRepository
+        self.houstonService = houstonService
+        super.init(name: name)
+    }
+    
+    func run() {
+        let single = houstonService.fetchOperations()
+            .do(onSuccess: { [weak self] operations in
+                // Store in local database
+                _ = self?.operationRepository
+                    .storeOperations(operations)
+                    .subscribe()
+            })
+        
+        runSingle(single)
+    }
+}
+```
+
+### Create Operation
+
+```swift
+class CreateOperationAction: AsyncAction<Operation> {
+    
+    private let operationRepository: OperationRepository
+    private let keysRepository: KeysRepository
+    private let houstonService: HoustonService
+    
+    func run(amount: Satoshis, address: String, fee: Satoshis) {
+        let single = Single.deferred { [weak self] in
+            guard let self = self else {
+                throw MuunError(Errors.deallocated)
+            }
+            
+            // Create unsigned operation
+            return self.houstonService.createOperation(
+                amount: amount,
+                address: address,
+                fee: fee
+            )
+        }
+        .flatMap { [weak self] operation in
+            // Sign transaction
+            return self?.signOperation(operation) ?? .error(MuunError())
+        }
+        .flatMap { [weak self] signedOperation in
+            // Submit to network
+            return self?.houstonService.submitOperation(signedOperation) 
+                ?? .error(MuunError())
+        }
+        .do(onSuccess: { [weak self] operation in
+            // Store locally
+            _ = self?.operationRepository
+                .storeOperations([operation])
+                .subscribe()
+        })
+        
+        runSingle(single)
+    }
+    
+    private func signOperation(_ operation: Operation) -> Single<Operation> {
+        return Single.deferred { [weak self] in
+            guard let privateKey = try? self?.keysRepository.getPrivateKey() else {
+                throw KeysError.notFound
+            }
+            
+            // Sign using libwallet
+            let signedTx = try SignTransaction(operation.transaction!, privateKey)
+            
+            var signed = operation
+            signed.transaction = signedTx
+            signed.status = .SIGNED
+            
+            return Single.just(signed)
+        }
+    }
+}
+```
+
+### User Authentication
+
+```swift
+class LoginAction: AsyncAction<User> {
+    
+    private let userRepository: UserRepository
+    private let sessionRepository: SessionRepository
+    private let houstonService: HoustonService
+    
+    func run(email: String, password: String) {
+        let single = houstonService.login(email: email, password: password)
+            .do(onSuccess: { [weak self] response in
+                // Store auth token
+                try? self?.sessionRepository.storeAuthToken(response.token)
+                
+                // Store user
+                self?.userRepository.setUser(response.user)
+            })
+            .map { $0.user }
+        
+        runSingle(single)
+    }
+}
+```
+
+### Sync Data
+
+```swift
+class SyncAction: AsyncAction<Void> {
+    
+    private let operationRepository: OperationRepository
+    private let userRepository: UserRepository
+    private let houstonService: HoustonService
+    
+    func run() {
+        let completable = fetchUser()
+            .andThen(fetchOperations())
+            .andThen(fetchExchangeRates())
+        
+        runCompletable(completable)
+    }
+    
+    private func fetchUser() -> Completable {
+        return houstonService.fetchUser()
+            .do(onSuccess: { [weak self] user in
+                self?.userRepository.setUser(user)
+            })
+            .asCompletable()
+    }
+    
+    private func fetchOperations() -> Completable {
+        return houstonService.fetchOperations()
+            .flatMapCompletable { [weak self] operations in
+                return self?.operationRepository.storeOperations(operations)
+                    ?? Completable.empty()
+            }
+    }
+    
+    private func fetchExchangeRates() -> Completable {
+        return houstonService.fetchExchangeRates()
+            .do(onSuccess: { rates in
+                // Store rates
+            })
+            .asCompletable()
+    }
+}
+```
+
+## Usage in ViewControllers
+
+### Subscribe to State
+
+```swift
+class OperationsViewController: MUViewController {
+    
+    private let fetchOperationsAction: AsyncAction<[Operation]>
+    private let disposeBag = DisposeBag()
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        
+        fetchOperationsAction.getState()
+            .subscribe(onNext: { [weak self] state in
+                switch state.type {
+                case .EMPTY:
+                    break
+                    
+                case .LOADING:
+                    self?.showLoading("Fetching operations...")
+                    
+                case .VALUE:
+                    self?.dismissLoading()
+                    if let operations = state.getValue() {
+                        self?.updateUI(operations: operations)
+                    }
+                    
+                case .ERROR:
+                    self?.dismissLoading()
+                    if let error = state.getError() {
+                        self?.showError(error)
+                    }
+                }
+            })
+            .disposed(by: disposeBag)
+    }
+    
+    @objc func onRefreshTapped() {
+        fetchOperationsAction.run()
+    }
+}
+```
+
+### Get Single Value
+
+```swift
+class SendViewController: MUViewController {
+    
+    private let createOperationAction: AsyncAction<Operation>
+    
+    @objc func onSendTapped() {
+        showLoading("Sending...")
+        
+        createOperationAction.run(
+            amount: amount,
+            address: address,
+            fee: fee
+        )
+        
+        createOperationAction.getValue()
+            .subscribe(
+                onSuccess: { [weak self] operation in
+                    self?.dismissLoading()
+                    self?.showSuccess("Payment sent!")
+                    self?.navigationController?.popViewController(animated: true)
+                },
+                onError: { [weak self] error in
+                    self?.dismissLoading()
+                    self?.showError(error)
+                }
+            )
+            .disposed(by: disposeBag)
+    }
+}
+```
+
+## Action Organization
+
+Actions are organized by domain:
+
+```swift
+Domain/Action/
+├── Base/
+│   ├── AsyncAction.swift
+│   └── ActionState.swift
+├── Address/
+│   ├── AddressActions.swift
+│   └── SyncExternalAddresses.swift
+├── Operations/
+│   ├── CreateOperationAction.swift
+│   ├── FetchOperationsAction.swift
+│   └── CancelOperationAction.swift
+├── Session/
+│   ├── LoginAction.swift
+│   ├── LogoutAction.swift
+│   └── CreateSessionAction.swift
+├── IncomingSwap/
+│   ├── FulfillIncomingSwapAction.swift
+│   └── ExpireIncomingSwapAction.swift
+└── RealTime/
+    ├── SyncAction.swift
+    └── FetchNotificationsAction.swift
+```
+
+## Benefits
+
+<AccordionGroup>
+  <Accordion title="State Management">
+    AsyncAction automatically manages loading, success, and error states. ViewControllers just react to state changes.
+  </Accordion>
+
+  <Accordion title="Prevents Duplicates">
+    AsyncAction won't run if already loading, preventing duplicate API calls or operations.
+  </Accordion>
+
+  <Accordion title="Background Execution">
+    Operations run on background scheduler by default, keeping UI responsive.
+  </Accordion>
+
+  <Accordion title="Composable">
+    Actions can chain multiple operations using RxSwift operators (flatMap, andThen, etc.).
+  </Accordion>
+
+  <Accordion title="Testable">
+    Actions are independent of UI and can be tested with mock repositories.
+  </Accordion>
+
+  <Accordion title="Reusable">
+    Same action can be used from multiple view controllers.
+  </Accordion>
+</AccordionGroup>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Single Responsibility">
+    Each action should do one thing. For example, `CreateOperationAction` creates an operation, `FetchOperationsAction` fetches operations.
+  </Accordion>
+
+  <Accordion title="Dependency Injection">
+    Inject repositories and services through the constructor, not accessed directly.
+  </Accordion>
+
+  <Accordion title="Error Handling">
+    Let RxSwift operators handle errors. Use `.catchError()` or `.retry()` as needed.
+  </Accordion>
+
+  <Accordion title="Side Effects in do">
+    Use `.do(onSuccess:)` for side effects like storing data locally.
+  </Accordion>
+
+  <Accordion title="Reset After Error">
+    ViewControllers should call `action.reset()` after handling errors to allow retry.
+  </Accordion>
+</AccordionGroup>
+
+## Advanced Patterns
+
+### Chained Actions
+
+```swift
+class CompleteOnboardingAction: AsyncAction<User> {
+    
+    private let createWalletAction: AsyncAction<Wallet>
+    private let setupEmailAction: AsyncAction<Void>
+    private let exportKeysAction: AsyncAction<Void>
+    
+    func run() {
+        let single = createWalletAction.getValue()
+            .flatMap { _ in self.setupEmailAction.getValue() }
+            .flatMap { _ in self.exportKeysAction.getValue() }
+            .flatMap { _ in self.fetchUser() }
+        
+        // Trigger first action
+        createWalletAction.run()
+        
+        runSingle(single)
+    }
+}
+```
+
+### Conditional Execution
+
+```swift
+func run() {
+    let single = checkBalance()
+        .flatMap { balance in
+            if balance >= requiredAmount {
+                return self.createOperation()
+            } else {
+                return Single.error(InsufficientFundsError())
+            }
+        }
+    
+    runSingle(single)
+}
+```
+
+### Parallel Operations
+
+```swift
+func run() {
+    let operations = Single.zip(
+        houstonService.fetchOperations(),
+        houstonService.fetchExchangeRates(),
+        houstonService.fetchUser()
+    )
+    .map { (operations, rates, user) in
+        // All fetched in parallel
+        return (operations, rates, user)
+    }
+    
+    runSingle(operations)
+}
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Domain Models" icon="cube" href="/ios/domain/models">
+    Models that actions operate on
+  </Card>
+  <Card title="Domain Services" icon="gears" href="/ios/domain/services">
+    Services used by actions
+  </Card>
+</CardGroup>

@@ -1,0 +1,564 @@
+---
+title: Testing
+description: Run unit tests, UI tests, and understand the testing architecture for Muun Wallet iOS
+---
+
+The Muun Wallet iOS app includes comprehensive unit tests and UI automation tests to ensure reliability and security.
+
+## Test Targets
+
+The project includes two test targets:
+
+<Steps>
+  <Step title="falconTests (Unit Tests)">
+    Tests business logic, data layer, and domain layer components.
+    
+    **Location:** `falcon/app/falconTests/`
+    
+    **Test count:** 100+ unit tests
+  </Step>
+
+  <Step title="falconUITests (UI Tests)">
+    End-to-end UI automation tests using XCTest UI testing framework.
+    
+    **Location:** `falcon/app/falconUITests/`
+  </Step>
+</Steps>
+
+## Running Tests
+
+### Run Tests in Xcode
+
+<Steps>
+  <Step title="Open the workspace">
+    ```bash
+    cd falcon/app
+    open falcon.xcworkspace
+    ```
+  </Step>
+
+  <Step title="Select test scheme">
+    Choose the **Muun** scheme in the scheme selector
+  </Step>
+
+  <Step title="Run tests">
+    - Press **Cmd+U** to run all tests
+    - Press **Ctrl+Opt+Cmd+U** to run tests with code coverage
+    - Click the diamond icon next to a test method to run a single test
+  </Step>
+</Steps>
+
+### Run Tests from Command Line
+
+<CodeGroup>
+  ```bash All Unit Tests
+  cd falcon/app
+  
+  xcodebuild test \
+    -workspace falcon.xcworkspace \
+    -scheme Muun \
+    -testPlan UnitTests \
+    -destination 'platform=iOS Simulator,name=iPhone 15' \
+    -enableCodeCoverage YES
+  ```
+
+  ```bash Specific Test Class
+  xcodebuild test \
+    -workspace falcon.xcworkspace \
+    -scheme Muun \
+    -only-testing:falconTests/BalanceActionsTests \
+    -destination 'platform=iOS Simulator,name=iPhone 15'
+  ```
+
+  ```bash Single Test Method
+  xcodebuild test \
+    -workspace falcon.xcworkspace \
+    -scheme Muun \
+    -only-testing:falconTests/BalanceActionsTests/test_syncAgain \
+    -destination 'platform=iOS Simulator,name=iPhone 15'
+  ```
+
+  ```bash UI Tests
+  xcodebuild test \
+    -workspace falcon.xcworkspace \
+    -scheme FalconUITestsScheme \
+    -destination 'platform=iOS Simulator,name=iPhone 15'
+  ```
+</CodeGroup>
+
+## Test Structure
+
+The test suite is organized by layer:
+
+```bash
+falconTests/
+├── Domain/                  # Business logic tests
+│   ├── Action/
+│   │   ├── Operations/
+│   │   │   └── BalanceActionsTests.swift
+│   │   └── PreloadFeeDataActionTests.swift
+│   └── AddressActionsTests.swift
+├── DTO/                     # Data transfer object tests
+├── Extension/               # Swift extension tests
+├── Factories/               # Test data factories
+│   └── Factory.swift
+├── Mocking/                 # Mock implementations
+├── Presentation/            # UI logic tests
+├── Repositories/            # Data access tests
+│   ├── IncomingSwapRepositoryTests.swift
+│   └── OperationRepositoryTests.swift
+└── MuunTestCase.swift      # Base test class
+```
+
+## Base Test Class
+
+All unit tests inherit from `MuunTestCase`, which sets up the testing environment:
+
+```swift falconTests/MuunTestCase.swift
+import XCTest
+import Dip
+import GRDB
+import RxSwift
+import RxBlocking
+@testable import Muun
+import Libwallet
+
+class MuunTestCase: XCTestCase {
+    var containers: [DependencyContainer] = []
+    var userDefaults: UserDefaults!
+    var compositeDisposable: CompositeDisposable?
+    
+    override func setUp() {
+        try? FileManager.default.removeItem(at: libwalletStorageURL)
+        
+        setupTestingContext()
+        compositeDisposable = CompositeDisposable()
+        
+        // Clean database before each test
+        try! (resolve() as DatabaseCoordinator).wipeAll()
+    }
+    
+    override func tearDown() {
+        // Clean up after each test
+        (resolve() as SecureStorage).wipeAll()
+        try! (resolve() as DatabaseCoordinator).wipeAll()
+        try? FileManager.default.removeItem(at: libwalletStorageURL)
+        
+        // Reset dependency containers
+        DIManager.testing_resetCurrentContainer()
+        containers.forEach { $0.reset() }
+        containers = []
+        
+        compositeDisposable?.dispose()
+        userDefaults.removePersistentDomain(forName: userDefaultsDomain)
+    }
+}
+```
+
+<Note>
+  The base test class:
+  - Creates isolated test databases
+  - Sets up dependency injection containers
+  - Cleans up all state between tests
+  - Provides helper methods for async testing
+</Note>
+
+## Test Factories
+
+The test suite uses factory methods to create test data:
+
+```swift falconTests/Factories/Factory.swift
+class Factory {
+    // Create test operations
+    static func createOperation() -> Operation {
+        // Factory implementation
+    }
+    
+    // Create test users
+    static func createUser() -> User {
+        // Factory implementation
+    }
+    
+    // Create test swaps
+    static func createIncomingSwap() -> IncomingSwap {
+        // Factory implementation
+    }
+}
+```
+
+```swift falconTests/Factories/Factory+Operation.swift
+extension Factory {
+    static func operation(
+        id: Int64 = 1,
+        isExternal: Bool = false,
+        status: OperationStatus = .confirmed
+    ) -> Operation {
+        // Create operation with default or custom values
+    }
+}
+```
+
+## Example Unit Tests
+
+### Testing Actions (Use Cases)
+
+```swift falconTests/Domain/Action/Operations/BalanceActionsTests.swift
+import XCTest
+import RxSwift
+import RxBlocking
+@testable import Muun
+
+class BalanceActionsTests: MuunTestCase {
+    var balanceActions: BalanceActions!
+    var operationRepository: OperationRepository!
+    
+    override func setUp() {
+        super.setUp()
+        
+        balanceActions = resolve()
+        operationRepository = resolve()
+    }
+    
+    func test_calculateBalance() throws {
+        // Given: operations in database
+        let op1 = Factory.operation(amount: 100_000, status: .confirmed)
+        let op2 = Factory.operation(amount: 50_000, status: .confirmed)
+        
+        try operationRepository.store([op1, op2])
+        
+        // When: calculating balance
+        let balance = try balanceActions.getBalance().toBlocking().first()!
+        
+        // Then: balance is correct
+        XCTAssertEqual(balance.totalSats, 150_000)
+    }
+    
+    func test_syncAgain() throws {
+        // Test synchronization logic
+    }
+}
+```
+
+### Testing Repositories
+
+```swift falconTests/Repositories/OperationRepositoryTests.swift
+import XCTest
+import RxSwift
+import RxBlocking
+@testable import Muun
+
+class OperationRepositoryTests: MuunTestCase {
+    var repository: OperationRepository!
+    
+    override func setUp() {
+        super.setUp()
+        repository = resolve()
+    }
+    
+    func test_storeAndFetch() throws {
+        // Given
+        let operation = Factory.createOperation()
+        
+        // When
+        try repository.store(operation)
+        let fetched = try repository.fetch(by: operation.id).toBlocking().first()!
+        
+        // Then
+        XCTAssertEqual(fetched?.id, operation.id)
+        XCTAssertEqual(fetched?.amount, operation.amount)
+    }
+    
+    func test_watchOperations() throws {
+        // Test reactive observation of operations
+        let expectation = self.expectation(description: "operations changed")
+        
+        let disposable = repository.watchOperations()
+            .subscribe(onNext: { operations in
+                if operations.count == 1 {
+                    expectation.fulfill()
+                }
+            })
+        
+        // Trigger change
+        try repository.store(Factory.createOperation())
+        
+        waitForExpectations(timeout: 5.0)
+        disposable.dispose()
+    }
+}
+```
+
+### Testing Libwallet Integration
+
+```swift falconTests/Domain/AddressActionsTests.swift
+import XCTest
+import RxBlocking
+import Libwallet
+@testable import Muun
+
+class AddressActionsTests: MuunTestCase {
+    var addressActions: AddressActions!
+    
+    override func setUp() {
+        super.setUp()
+        addressActions = resolve()
+    }
+    
+    func test_generateAddress() throws {
+        // Test address generation through libwallet
+        let addresses = try addressActions.generateAddressSet().toBlocking().first()!
+        
+        XCTAssertTrue(addresses.legacy.starts(with: "1") || addresses.legacy.starts(with: "3"))
+        XCTAssertTrue(addresses.segwit.starts(with: "bc1"))
+        XCTAssertTrue(addresses.taproot.starts(with: "bc1p"))
+    }
+}
+```
+
+## UI Testing with Page Objects
+
+UI tests use the Page Object pattern for maintainability:
+
+```swift falconUITests/Presentation/TransactionListPage.swift
+import XCTest
+
+class TransactionListPage: BasePage {
+    private let transactionCell = XCUIApplication().cells["transaction_cell"]
+    private let emptyStateView = XCUIApplication().staticTexts["empty_state"]
+    
+    func tapTransaction(at index: Int) {
+        transactionCell.children(matching: .cell).element(boundBy: index).tap()
+    }
+    
+    func assertHasTransactions() {
+        XCTAssertTrue(transactionCell.exists)
+    }
+    
+    func assertEmpty() {
+        XCTAssertTrue(emptyStateView.exists)
+    }
+}
+```
+
+```swift falconUITests/TransactionListTests.swift
+import XCTest
+
+class TransactionListTests: XCTestCase {
+    var app: XCUIApplication!
+    
+    override func setUp() {
+        super.setUp()
+        
+        app = XCUIApplication()
+        app.launchArguments = ["--uitesting"]
+        app.launch()
+    }
+    
+    func test_displayTransactions() {
+        // Given: user is logged in
+        let loginPage = LoginPage()
+        loginPage.login()
+        
+        // When: navigating to transactions
+        let transactionListPage = TransactionListPage()
+        
+        // Then: transactions are displayed
+        transactionListPage.assertHasTransactions()
+    }
+}
+```
+
+## Test Plan Configuration
+
+The project uses an `.xctestplan` file to configure test execution:
+
+```json falcon/app/UnitTests.xctestplan
+{
+  "configurations": [
+    {
+      "id": "C44A8FCC-DDE7-43D9-887B-FB90B49477A3",
+      "name": "Configuration 1",
+      "options": {}
+    }
+  ],
+  "defaultOptions": {
+    "language": "en",
+    "region": "US"
+  },
+  "testTargets": [
+    {
+      "skippedTests": [
+        "FCMTokenActionTest/test_syncAgainOnNewTokenReceivedWhileSyncing()"
+      ],
+      "target": {
+        "containerPath": "container:falcon.xcodeproj",
+        "identifier": "0F18C6C92130993500BC5BFE",
+        "name": "falconTests"
+      }
+    }
+  ],
+  "version": 1
+}
+```
+
+## Mocking
+
+The test suite includes mock implementations for external services:
+
+```swift falconTests/Mocking/MockHoustonService.swift
+class MockHoustonService: HoustonService {
+    var mockResponse: Any?
+    var shouldFail = false
+    
+    override func fetchRealTimeData() -> Single<RealTimeData> {
+        if shouldFail {
+            return Single.error(MuunError(ServiceError.networkError))
+        }
+        return Single.just(mockResponse as! RealTimeData)
+    }
+}
+```
+
+## Testing RxSwift Code
+
+The project uses `RxBlocking` for testing reactive code:
+
+```swift
+import RxSwift
+import RxBlocking
+
+func test_observableCompletion() throws {
+    let observable = repository.watchData()
+    
+    // Block and get first value
+    let value = try observable.toBlocking().first()!
+    XCTAssertNotNil(value)
+    
+    // Block and get all values (use with take)
+    let values = try observable.take(3).toBlocking().toArray()
+    XCTAssertEqual(values.count, 3)
+}
+```
+
+## Code Coverage
+
+View code coverage in Xcode:
+
+1. Run tests with coverage: **Cmd+U**
+2. Open the Report Navigator: **Cmd+9**
+3. Select the latest test run
+4. Click the **Coverage** tab
+
+### Coverage from Command Line
+
+```bash
+xcodebuild test \
+  -workspace falcon.xcworkspace \
+  -scheme Muun \
+  -destination 'platform=iOS Simulator,name=iPhone 15' \
+  -enableCodeCoverage YES \
+  -resultBundlePath ./TestResults.xcresult
+
+# Extract coverage report
+xcrun xccov view --report ./TestResults.xcresult
+```
+
+## Continuous Integration
+
+Tests run automatically in CI pipelines. Example GitHub Actions workflow:
+
+```yaml .github/workflows/test.yml
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up environment
+        run: |
+          brew install go
+          cd libwallet/librs && ./makelibs.sh
+          cd ../../tools && ./bootstrap-gomobile.sh
+      
+      - name: Install dependencies
+        run: |
+          cd falcon/app
+          bundle install
+          pod install
+      
+      - name: Run tests
+        run: |
+          cd falcon/app
+          xcodebuild test \
+            -workspace falcon.xcworkspace \
+            -scheme Muun \
+            -destination 'platform=iOS Simulator,name=iPhone 15' \
+            -enableCodeCoverage YES
+```
+
+## Best Practices
+
+<Steps>
+  <Step title="Isolate tests">
+    Each test should be independent and not rely on the state from other tests. The `MuunTestCase` base class ensures clean state.
+  </Step>
+
+  <Step title="Use factories">
+    Create test data using factory methods for consistency and maintainability.
+  </Step>
+
+  <Step title="Test behavior, not implementation">
+    Focus on testing what the code does, not how it does it.
+  </Step>
+
+  <Step title="Mock external dependencies">
+    Use mock objects for network services, secure storage, and other external systems.
+  </Step>
+
+  <Step title="Keep tests fast">
+    Unit tests should run in milliseconds. Avoid unnecessary waits and network calls.
+  </Step>
+</Steps>
+
+## Troubleshooting Tests
+
+<Accordion title="Tests fail due to libwallet errors">
+  Ensure libwallet is built correctly:
+  ```bash
+  cd libwallet
+  ../tools/libwallet-ios.sh
+  ```
+</Accordion>
+
+<Accordion title="Database errors in tests">
+  The test database might be corrupted:
+  ```bash
+  rm -rf ~/Library/Developer/CoreSimulator/Devices/*/data/Library/ApplicationSupport/test-db.sqlite
+  ```
+</Accordion>
+
+<Accordion title="UI tests fail to launch app">
+  1. Reset simulator: **Device > Erase All Content and Settings**
+  2. Ensure the app scheme is set to **Shared**
+  3. Check that UI testing arguments are configured
+</Accordion>
+
+<Accordion title="Flaky async tests">
+  Increase timeout values or use proper expectations:
+  ```swift
+  let expectation = self.expectation(description: "async operation")
+  // ... perform async work ...
+  waitForExpectations(timeout: 10.0)
+  ```
+</Accordion>
+
+## Next Steps
+
+- Review the [project structure](/development/project-structure)
+- Learn about the [build process](/development/building)
+- Explore the [development setup](/development/setup)

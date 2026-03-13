@@ -1,0 +1,459 @@
+---
+title: "Security Center"
+description: "Complete your wallet security setup with email backup, recovery code, and Emergency Kit"
+---
+
+## Overview
+
+The Security Center is your hub for setting up and managing wallet security. It guides you through a three-step backup process that ensures you can always recover your bitcoin.
+
+<Note>
+Completing all three security steps is essential for protecting your funds. Each step adds an additional layer of recovery options.
+</Note>
+
+## Security Setup Progress
+
+The Security Center displays your backup progress with a visual indicator:
+
+```swift
+func backUpProgressMultiplier() -> CGFloat {
+    if !isBackUpProgressStarted() {
+        return 0.1
+    }
+    
+    if isBackUpProgressFinished() {
+        return 1
+    }
+    
+    if hasEmailAndPassword() && hasRecoveryCode() {
+        return 0.8
+    }
+    
+    // User has either RC or email, but not both
+    return 0.5
+}
+```
+
+### Progress Stages
+
+| Progress | Completed Steps | Status |
+|----------|----------------|--------|
+| 10% | None | Not started |
+| 50% | Email OR Recovery Code | In progress |
+| 80% | Email AND Recovery Code | Almost done |
+| 100% | Email, Recovery Code, Emergency Kit | Complete |
+
+## Three-Step Security Setup
+
+Muun's security model uses three complementary backup mechanisms:
+
+<Steps>
+  <Step title="Set Up Email">
+    Link an email address and create a password for cloud-based recovery.
+  </Step>
+  
+  <Step title="Generate Recovery Code">
+    Create a 32-character recovery code for offline backup.
+  </Step>
+  
+  <Step title="Export Emergency Kit">
+    Generate a PDF containing your encrypted private keys.
+  </Step>
+</Steps>
+
+## Email Setup
+
+Email backup provides convenient recovery through Muun's servers:
+
+### Setup Flow
+
+<Accordion title="1. Email Entry">
+  Enter your email address. Muun will send a verification code.
+  
+  ```swift
+  class SignUpEmailPresenter {
+      // Handles email validation and submission
+      // Checks if email is already in use
+  }
+  ```
+  
+  <Warning>
+  Use an email you'll have long-term access to. If you lose access to this email, you'll need your recovery code and Emergency Kit to recover your wallet.
+  </Warning>
+</Accordion>
+
+<Accordion title="2. Create Password">
+  Set a strong password that encrypts your wallet data.
+  
+  ```swift
+  class SignUpPasswordPresenter {
+      // Validates password strength
+      // Encrypts wallet with password
+  }
+  ```
+  
+  Password requirements:
+  - Minimum length (typically 8+ characters)
+  - Don't reuse passwords from other services
+  - Store securely (password manager recommended)
+</Accordion>
+
+<Accordion title="3. Verify Email">
+  Check your email and enter the verification code.
+  
+  ```swift
+  class SignUpVerifyEmailPresenter {
+      // Handles verification code entry
+      // Completes email setup
+  }
+  ```
+</Accordion>
+
+<Accordion title="4. Finish Setup">
+  Confirmation that email backup is active.
+  
+  ```swift
+  class FinishEmailSetupPresenter {
+      // Finalizes email configuration
+      // Updates security center status
+  }
+  ```
+</Accordion>
+
+### Email Status
+
+The Security Center tracks your email setup state:
+
+```swift
+func getEmailCard() -> ActionCardModel {
+    let hasRc = sessionActions.hasRecoveryCode()
+    let wording: SetUpEmailWording = hasRc ? .recoveryCodeSetup : .recoveryCodeNotSetup
+    
+    // If the user has email set up -> Card = complete
+    if hasEmailAndPassword(), let email = sessionActions.getUserEmail() {
+        return ActionCard.emailComplete(wording: wording, email: email)
+    }
+    
+    // Skipped or active states
+    if sessionActions.isEmailSkipped() {
+        return ActionCard.emailIncomplete(wording: wording, state: .skipped)
+    }
+    
+    return ActionCard.emailIncomplete(wording: .recoveryCodeNotSetup, state: .active)
+}
+```
+
+### Skip Email (Not Recommended)
+
+You can skip email setup, but this is not recommended:
+
+```swift
+func emailStatusLogParam() -> String {
+    if hasEmailAndPassword() {
+        return "completed"
+    }
+    
+    if sessionActions.isEmailSkipped() {
+        return "skipped"
+    }
+    
+    return "not_set"
+}
+```
+
+<Warning>
+Skipping email setup means you'll rely entirely on your recovery code and Emergency Kit. Make sure you have secure, accessible backups of both.
+</Warning>
+
+## Recovery Code
+
+The recovery code is a 32-character string that serves as an offline backup:
+
+### Setup Flow
+
+<Steps>
+  <Step title="Priming">
+    Learn about the recovery code and its importance.
+    
+    ```swift
+    class RecoveryCodePrimingPresenter {
+        // Explains recovery code concept
+        // Prepares user for generation
+    }
+    ```
+  </Step>
+  
+  <Step title="Generate">
+    The app generates a unique recovery code:
+    
+    ```go
+    func Generate() string {
+        var sb strings.Builder
+        sb.WriteByte('L')
+        // Version indicator (A = version 2)
+        sb.WriteByte(Alphabet[CurrentVersion-2])
+        
+        codeLen := 30
+        for i := 0; i < codeLen; i++ {
+            sb.WriteByte(randChar(Alphabet))
+            j := i + 3
+            if j != 0 && i != codeLen-1 && j%4 == 0 {
+                sb.WriteByte('-')
+            }
+        }
+        
+        return sb.String()
+    }
+    ```
+    
+    Format: `LABC-DEFG-HIJK-LMNO-PQRS-TUVW-XYZ2-3457`
+  </Step>
+  
+  <Step title="Write It Down">
+    Copy your recovery code to a secure location.
+    
+    <Warning>
+    Write down your recovery code on paper and store it securely. Do NOT store it digitally (no screenshots, no cloud notes).
+    </Warning>
+  </Step>
+  
+  <Step title="Verify">
+    Re-enter your recovery code to confirm you've saved it correctly.
+    
+    ```swift
+    class VerifyRecoveryCodeViewController {
+        // Validates user can reproduce the code
+    }
+    ```
+  </Step>
+  
+  <Step title="Confirm">
+    Complete recovery code setup.
+    
+    ```swift
+    class FinishRecoveryCodeSetupPresenter {
+        // Finalizes recovery code configuration
+    }
+    ```
+  </Step>
+</Steps>
+
+### Recovery Code Format
+
+Recovery codes use a carefully chosen character set:
+
+```go
+// No visually similar characters (O, I, L, 0, 1, 6)
+const Alphabet = "ABCDEFHJKLMNPQRSTUVWXYZ2345789"
+
+// Legacy format support
+const AlphabetLegacy = "ABCDEFHJKMNPQRSTUVWXYZ2345789"
+```
+
+### Security Status
+
+The Security Center tracks recovery code setup:
+
+```swift
+func getRecoveryCodeCard() -> ActionCardModel {
+    // If the user has recovery code set up -> Card = complete
+    if sessionActions.hasRecoveryCode() {
+        let wording: SetUpRecoveryCodeWording = hasEmailAndPassword() ? .emailSetup : .emailNotSetup
+        if let email = sessionActions.getUserEmail() {
+            return ActionCard.recoveryCodeComplete(wording: wording, email: email)
+        }
+        return ActionCard.recoveryCodeComplete(wording: wording)
+    }
+    
+    // Active with email, active with email skipped, or inactive
+    if hasEmailAndPassword() {
+        return ActionCard.recoveryCodeIncomplete(wording: .emailSetup, 
+                                                state: .active, 
+                                                emailSkipped: false)
+    }
+    
+    if sessionActions.isEmailSkipped() {
+        return ActionCard.recoveryCodeIncomplete(wording: .emailNotSetup, 
+                                                state: .active, 
+                                                emailSkipped: true)
+    }
+    
+    return ActionCard.recoveryCodeIncomplete(wording: .emailNotSetup, 
+                                            state: .inactive, 
+                                            emailSkipped: false)
+}
+```
+
+## Emergency Kit
+
+The Emergency Kit is the final and most comprehensive backup method:
+
+### Setup Flow
+
+<Steps>
+  <Step title="Learn About Emergency Kit">
+    Introduction slides explain what the Emergency Kit is and why it's important.
+    
+    ```swift
+    class SlidesViewController {
+        // Educational slides about Emergency Kit
+    }
+    ```
+  </Step>
+  
+  <Step title="Generate Kit">
+    The app generates your Emergency Kit PDF containing encrypted keys.
+  </Step>
+  
+  <Step title="Choose Save Method">
+    Select how to save your Emergency Kit:
+    - Google Drive (recommended if available)
+    - iCloud Drive
+    - Manual save
+  </Step>
+  
+  <Step title="Verify Kit">
+    Enter the 6-digit verification code from your Emergency Kit to confirm it was saved correctly.
+  </Step>
+</Steps>
+
+### Security Status
+
+Emergency Kit status in Security Center:
+
+```swift
+func getEmergencyKitCard() -> ActionCardModel {
+    // 1. User exported emergency kit
+    if didExportEmergencyKit() {
+        return ActionCard.emergencyKitComplete()
+    }
+    
+    // 2. User exported private keys (deprecated flow)
+    if didExportPrivateKeys() {
+        return ActionCard.exportKeysComplete()
+    }
+    
+    // 3. User doesn't have RC setup -> Card = inactive
+    if !sessionActions.hasRecoveryCode() {
+        return ActionCard.emergencyKitIncomplete(state: .inactive)
+    }
+    
+    // 4. User does have recovery code setup -> Card = active
+    return ActionCard.emergencyKitIncomplete(state: .active)
+}
+```
+
+<Info>
+The Emergency Kit step only becomes active after you've set up your recovery code.
+</Info>
+
+## Security Center UI
+
+The Security Center uses action cards to display each security step:
+
+### Card States
+
+```swift
+enum ActionCardState {
+    case active      // Ready to complete
+    case inactive    // Prerequisites not met
+    case skipped     // User chose to skip
+}
+```
+
+### Progress Tracking
+
+```swift
+func isBackUpProgressStarted() -> Bool {
+    return hasRecoveryCode() || hasEmailAndPassword()
+}
+
+func isBackUpProgressFinished() -> Bool {
+    return didExportEmergencyKit() || didExportPrivateKeys()
+}
+
+func nextStepLogParam() -> String {
+    if !isBackUpProgressStarted() {
+        return "set_up_email"
+    }
+    
+    if isBackUpProgressFinished() {
+        return "fully_set"
+    }
+    
+    if hasRecoveryCode() {
+        return "emergency_kit"
+    }
+    
+    return "set_up_recovery_code"
+}
+```
+
+## Security Best Practices
+
+<Steps>
+  <Step title="Complete All Three Steps">
+    Each backup method serves a different purpose and recovery scenario. Complete all three for maximum protection.
+  </Step>
+  
+  <Step title="Store Separately">
+    Keep your recovery code and Emergency Kit in different secure locations.
+  </Step>
+  
+  <Step title="Physical Copies">
+    Write down your recovery code and print your Emergency Kit. Digital-only backups can be lost.
+  </Step>
+  
+  <Step title="Test Your Backups">
+    Verify you can access your email, find your recovery code, and open your Emergency Kit PDF.
+  </Step>
+  
+  <Step title="Update When Needed">
+    If you change your recovery code or email, generate a new Emergency Kit.
+  </Step>
+</Steps>
+
+## Recovery Scenarios
+
+| Scenario | What You Need | Recovery Method |
+|----------|---------------|------------------|
+| Lost phone | Email + Password | Sign in on new device |
+| Forgot password | Recovery Code + Emergency Kit | Full wallet recovery |
+| Lost email access | Recovery Code + Emergency Kit | Full wallet recovery |
+| Lost recovery code | Email + Password | Sign in, then generate new RC |
+| Lost everything except one | Need at least two of three | Partial recovery possible |
+
+<Warning>
+You need at least TWO of the three backup methods (email+password, recovery code, Emergency Kit) to recover your wallet. Never lose more than one.
+</Warning>
+
+## Additional Security Features
+
+### Change Password
+
+Update your email password from Settings:
+
+```swift
+class ChangePasswordEnterCurrentPresenter {
+    // Verify current password
+}
+
+class ChangePasswordEnterNewPresenter {
+    // Set new password
+}
+```
+
+### Email Verification
+
+Re-verify your email if needed:
+
+```swift
+class ChangePasswordVerifyPresenter {
+    // Re-send verification email
+}
+```
+
+## Related Features
+
+- [Emergency Kit](/features/emergency-kit) - Detailed Emergency Kit guide
+- [Wallet Recovery](/features/wallet-recovery) - How to recover your wallet
