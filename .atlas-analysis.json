@@ -1,0 +1,159 @@
+{
+  "projectType": "saas",
+  "projectName": "Muun Wallet",
+  "projectDescription": "A non-custodial 2-of-2 multisig Bitcoin and Lightning wallet for iOS with a focus on security and ease of use.",
+  "theme": "palm",
+  "primaryColor": "#3383d1",
+  "lightColor": "#94c4e9",
+  "darkColor": "#040404",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/multisig-security",
+              "concepts/lightning-network",
+              "concepts/submarine-swaps"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "features/emergency-kit",
+              "features/wallet-recovery",
+              "features/sending-receiving",
+              "features/lightning-payments",
+              "features/security-center"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "development/setup",
+              "development/project-structure",
+              "development/building",
+              "development/testing"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "contributing/guidelines",
+              "contributing/security"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "iOS SDK",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "ios/overview",
+              "ios/architecture-layers"
+            ]
+          },
+          {
+            "group": "Data Layer",
+            "pages": [
+              "ios/data/repositories",
+              "ios/data/database",
+              "ios/data/keychain",
+              "ios/data/secure-storage"
+            ]
+          },
+          {
+            "group": "Domain Layer",
+            "pages": [
+              "ios/domain/models",
+              "ios/domain/use-cases",
+              "ios/domain/services"
+            ]
+          },
+          {
+            "group": "Presentation Layer",
+            "pages": [
+              "ios/presentation/screens",
+              "ios/presentation/components"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Libwallet",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "libwallet/overview",
+              "libwallet/getting-started"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "libwallet/addresses",
+              "libwallet/transactions",
+              "libwallet/signing",
+              "libwallet/fee-estimation"
+            ]
+          },
+          {
+            "group": "Lightning",
+            "pages": [
+              "libwallet/lightning/invoices",
+              "libwallet/lightning/swaps"
+            ]
+          },
+          {
+            "group": "Cryptography",
+            "pages": [
+              "libwallet/crypto/keys",
+              "libwallet/crypto/encryption",
+              "libwallet/crypto/musig"
+            ]
+          },
+          {
+            "group": "Emergency Kit",
+            "pages": [
+              "libwallet/emergency-kit/generation",
+              "libwallet/emergency-kit/recovery"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "2-of-2 multisig security model",
+    "Lightning Network support",
+    "Submarine swaps",
+    "Emergency Kit for recovery",
+    "Non-custodial architecture",
+    "Clean architecture (Data/Domain/Presentation)",
+    "Cross-platform libwallet (Go with gomobile)",
+    "Secure key storage and encryption"
+  ],
+  "publicApiSurface": [
+    "Libwallet Go API (address generation, transaction signing, fee estimation)",
+    "iOS Data Layer (repositories, database, keychain)",
+    "iOS Domain Layer (models, use cases, services)",
+    "Emergency Kit generation and recovery",
+    "Lightning invoice and swap operations",
+    "MuSig2 cryptographic operations",
+    "Wallet recovery tools"
+  ]
+}
